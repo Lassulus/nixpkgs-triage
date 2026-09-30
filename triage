@@ -604,19 +604,26 @@ def review_marker(r: sqlite3.Row) -> str:
     return r["review_status"] + ("*" if stale else "")
 
 
-CI_SHORT = {"SUCCESS": "ok", "FAILURE": "FAIL", "ERROR": "ERR", "PENDING": "..", "EXPECTED": ".."}
+# GitHub's combined check state of the head commit; "none" = no checks reported.
+CI_LABEL = {"SUCCESS": "pass", "FAILURE": "FAIL", "ERROR": "error", "PENDING": "pending", "EXPECTED": "pending"}
+
+
+def ci_label(state: str | None) -> str:
+    return CI_LABEL.get(state or "", "none")
 
 
 def print_rows(rows: list[sqlite3.Row]) -> None:
     width = shutil.get_terminal_size((160, 20)).columns
+    fmt = "{:<8} {:<18.18} {:<12.12} {:<14} {:>4} {:<7} {:<10} {}"
+    if rows:
+        print(fmt.format("PR", "category", "topics", "+added/-del", "age", "CI", "review", "title")[:width])
     for r in rows:
         topics = ",".join(json.loads(r["topics"]))
-        prefix = (
-            f"#{r['number']:<7} {r['category']:<18.18} {topics:<12.12} "
-            f"+{r['additions']}/-{r['deletions']:<6} {age(r['created_at']):>4} "
-            f"{CI_SHORT.get(r['ci_state'] or '', '-'):<4} {review_marker(r):<10} "
+        line = fmt.format(
+            f"#{r['number']}", r["category"], topics, f"+{r['additions']}/-{r['deletions']}",
+            age(r["created_at"]), ci_label(r["ci_state"]), review_marker(r), r["title"],
         )
-        print((prefix + r["title"])[:width])
+        print(line[:width])
 
 
 def cmd_list(args: argparse.Namespace) -> None:
@@ -807,6 +814,8 @@ class SyncJob:
 # (label, column, descending)
 UI_SORTS = (("oldest", "created_at", False), ("newest", "created_at", True), ("updated", "updated_at", True))
 
+# PR, age, CI, draft, review, title
+UI_PR_FORMAT = " {:<8} {:>4} {:<7} {:<5} {:<6.6} {}"
 UI_HELP = "tab/←→ pane  ↑↓ move  enter open  d drafts  o sort  R refresh  q quit"
 
 
@@ -895,7 +904,7 @@ class TriageUI:
         self.scr.refresh()
 
     def draw_list(self, h: int, w: int) -> None:
-        body = h - 2
+        body = h - 3  # title bar, column header, footer
         header = (
             f" nixpkgs-triage  {self.visible_count} open  sort: {UI_SORTS[self.sort_idx][0]}  "
             f"drafts: {'shown' if self.show_drafts else 'hidden'}  last sync: {self.last_sync or 'never'}"
@@ -903,6 +912,7 @@ class TriageUI:
         self.put(0, 0, header, w, curses.A_REVERSE)
 
         left_w = min(max(len(n) for n, _ in self.categories) + 9, w // 3)
+        self.put(1, 0, f" {'category':<{left_w - 9}} {'PRs':>6} ", left_w, curses.A_BOLD | curses.A_UNDERLINE)
         self.cat_top = min(max(self.cat_top, self.cat_idx - body + 1), self.cat_idx)
         for i, (name, count) in enumerate(self.categories[self.cat_top : self.cat_top + body]):
             idx = self.cat_top + i
@@ -911,33 +921,34 @@ class TriageUI:
                 attr = curses.A_REVERSE if self.focus == "cats" else curses.A_BOLD
             elif count == 0:
                 attr = self.dim
-            self.put(1 + i, 0, f" {name:<{left_w - 9}.{left_w - 9}} {count:>6} ", left_w, attr)
+            self.put(2 + i, 0, f" {name:<{left_w - 9}.{left_w - 9}} {count:>6} ", left_w, attr)
         try:
-            self.scr.vline(1, left_w, curses.ACS_VLINE, body)
+            self.scr.vline(1, left_w, curses.ACS_VLINE, body + 1)
         except curses.error:
             pass
 
         x = left_w + 1
         pw = w - x
         if pw > 0:
+            self.put(1, x, UI_PR_FORMAT.format("PR", "age", "CI", "draft", "review", "title"), pw,
+                     curses.A_BOLD | curses.A_UNDERLINE)
             self.pr_top = min(max(self.pr_top, self.pr_idx - body + 1), self.pr_idx)
             if not self.prs:
-                self.put(1, x, " no PRs in this category", pw, self.dim)
+                self.put(2, x, " no PRs in this category", pw, self.dim)
             for i, r in enumerate(self.prs[self.pr_top : self.pr_top + body]):
                 idx = self.pr_top + i
-                ci = CI_SHORT.get(r["ci_state"] or "", "-")
-                line = (
-                    f" #{r['number']:<7} {age(r['created_at']):>4} {ci:<4} {'D' if r['is_draft'] else ' '} "
-                    f"{review_marker(r):<6.6} {r['title']}"
+                line = UI_PR_FORMAT.format(
+                    f"#{r['number']}", age(r["created_at"]), ci_label(r["ci_state"]),
+                    "yes" if r["is_draft"] else "", review_marker(r), r["title"],
                 )
                 attr = curses.A_NORMAL
                 if r["is_draft"]:
                     attr = self.dim
-                if ci in ("FAIL", "ERR"):
+                if r["ci_state"] in ("FAILURE", "ERROR"):
                     attr = self.red
                 if idx == self.pr_idx:
                     attr = curses.A_REVERSE if self.focus == "prs" else curses.A_BOLD
-                self.put(1 + i, x, line, pw, attr)
+                self.put(2 + i, x, line, pw, attr)
 
         footer = UI_HELP
         if self.sync and self.sync.running:

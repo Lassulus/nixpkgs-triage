@@ -50,6 +50,14 @@ Edit the file and the next command re-categorizes the database locally, with no 
 The left pane lists the categories with their open counts, and the right pane lists the PRs in
 the selected category. Moving through the categories filters the PR list as you go.
 
+PR columns:
+
+- `age`: time since the PR was opened.
+- `CI`: combined GitHub check state of the latest commit: `pass`, `FAIL`, `error`, `pending`,
+  or `none` if no checks reported. Rows with failing CI are red.
+- `draft`: `yes` for draft PRs.
+- `review`: your local status from `triage mark`. A `*` means the PR changed after you marked it.
+
 | key | action |
 |---|---|
 | `tab`, `←`/`→`, `h`/`l` | switch pane |
