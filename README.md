@@ -91,7 +91,7 @@ safe: the sync time only advances when a sync completes, so the next refresh cat
 Shows the PR's metadata, the status of both jobs (`not run`, `pending` with queue time,
 `running` with duration, `success`/`failed` with the result summary, `cancelled`), and an output
 pane. While a job runs, the pane follows its live log; once it finishes, the pane shows the
-report. The `files` tab lists the changed files with change type and lines added and deleted per
+report; when no job has run for the PR, it opens on the `files` tab. That tab lists the changed files with change type and lines added and deleted per
 file. PRs synced before per-file counts were stored have their file list fetched once (1 API
 request) when you open that tab; `triage update --full` refreshes all of them.
 

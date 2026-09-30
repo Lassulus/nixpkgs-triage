@@ -509,10 +509,17 @@ class TriageUI:
 
     def open_detail(self, number: int) -> None:
         jobs = latest_jobs(self.db, number)
-        # Show the review output if that is the only thing that ran.
-        tab = "review" if (number, "review") in jobs and (number, "check") not in jobs else "check"
+        # Start on the output that exists: the check, else the review, else the changed files.
+        if (number, "check") in jobs:
+            tab = "check"
+        elif (number, "review") in jobs:
+            tab = "review"
+        else:
+            tab = "files"
         self.detail = {"pr": self.load_pr(number), "tab": tab, "log": False, "scroll": None}
         self.view = "detail"
+        if tab == "files":
+            self.ensure_file_counts()
 
     def ask_cancel(self, number: int, kind: str) -> None:
         job = self.jobs.get((number, kind))
