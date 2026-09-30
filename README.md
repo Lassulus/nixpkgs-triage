@@ -152,8 +152,18 @@ doesn't exist.
   only read-only tools (`read`, `grep`, `glob`). Its report has to cite the guideline section for
   every finding and ends with `VERDICT: PASS|ISSUES`.
 - **nixpkgs-review**: `review_command pr N --no-shell` in `nixpkgs_dir`, with its cache
-  directory inside the job directory. It uses GitHub's CI evaluation when possible (your token is
-  passed through). Status is `success` only if nothing failed to build.
+  directory inside the job directory. Status is `success` only if nothing failed to build.
+  Before a review starts, the job checks whether GitHub CI has a usable evaluation of the PR
+  head: a non-expired `comparison` artifact, which is what nixpkgs-review downloads.
+  - **Available, or CI still evaluating:** nixpkgs-review uses it (your token is passed through).
+  - **Missing, e.g. artifacts expired on older PRs:** the job adds `--eval local`. Otherwise
+    nixpkgs-review would poll for 10 minutes and then fail with "No evaluation seems to be
+    available on GitHub".
+  - **Turns out unusable anyway:** if nixpkgs-review still reports that, the job retries once
+    with `--eval local`.
+  - **Your override:** an explicit `--eval …` in `review_args` is left alone.
+
+  Reviews that evaluated locally have `local eval` in their summary.
 - **Posting** posts the nixpkgs-review `report.md` as a comment, as your GitHub user, the same
   way `nixpkgs-review post-result` does.
 

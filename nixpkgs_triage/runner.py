@@ -227,12 +227,56 @@ def run_check(job: sqlite3.Row, settings: dict[str, str]) -> tuple[str, str, str
     return "success", verdicts[-1].upper() if verdicts else "no verdict", head
 
 
+# nixpkgs-review output when GitHub CI's evaluation can't be used (none after 10 min of polling, or expired).
+EVAL_UNAVAILABLE = ("No evaluation seems to be available on GitHub", "has expired or been removed")
+
+
+def github_eval_state(gh: GitHub, number: int) -> str:
+    """Whether nixpkgs-review can use GitHub CI's evaluation of the PR head: "ready", "running" or "missing".
+    Mirrors what nixpkgs-review looks for: a non-expired `comparison` artifact of an "Eval"/"PR" workflow run."""
+    head = json.loads(gh.get(f"/repos/{OWNER}/{REPO}/pulls/{number}"))["head"]["sha"]
+    runs = json.loads(gh.get(f"/repos/{OWNER}/{REPO}/actions/runs?head_sha={head}"))["workflow_runs"]
+    state = "missing"
+    for run in runs:
+        if run["name"] not in ("Eval", "PR"):
+            continue
+        if run["status"] != "completed":
+            state = "running"
+            continue
+        artifacts = json.loads(gh.get(run["artifacts_url"]))["artifacts"]
+        if any(a["name"] == "comparison" and not a["expired"] for a in artifacts):
+            return "ready"
+    return state
+
+
 def run_review(job: sqlite3.Row, settings: dict[str, str]) -> tuple[str, str, str | None]:
     number, jobdir = job["number"], Path(job["dir"])
     # nixpkgs-review puts its builddir (worktree, logs, report.md/json) under $NIXPKGS_REVIEW_CACHE_DIR.
     env = {**os.environ, "NIXPKGS_REVIEW_CACHE_DIR": str(jobdir), "GITHUB_TOKEN": github_token()}
-    code = run_tool(review_argv(settings, number), cwd=nixpkgs_dir(settings), env=env)
+    argv = review_argv(settings, number)
+    local = ["--eval", "local"]
+    eval_mode = "configured"  # an explicit --eval in the settings wins
+    if not any(arg == "--eval" or arg.startswith("--eval=") for arg in argv):
+        state = github_eval_state(GitHub(github_token(), delay=1.0, reserve=100), number)
+        # "missing" would make nixpkgs-review poll for 10 minutes and give up; evaluate locally right away.
+        eval_mode = "local" if state == "missing" else "github"
+        log(f"GitHub CI evaluation of the PR head: {state} -> {eval_mode} evaluation")
+        if eval_mode == "local":
+            argv += local
+
+    logfile = jobdir / "job.log"
+    log_start = logfile.stat().st_size
+    code = run_tool(argv, cwd=nixpkgs_dir(settings), env=env)
     reports = sorted(jobdir.glob("nixpkgs-review/pr-*/report.json"), key=lambda p: p.stat().st_mtime)
+    if not reports and eval_mode == "github":
+        with open(logfile, "rb") as f:
+            f.seek(log_start)
+            output = f.read().decode(errors="replace")
+        if any(marker in output for marker in EVAL_UNAVAILABLE):
+            log("GitHub CI evaluation turned out to be unavailable; retrying with --eval local")
+            eval_mode = "local"
+            code = run_tool(argv + local, cwd=nixpkgs_dir(settings), env=env)
+            reports = sorted(jobdir.glob("nixpkgs-review/pr-*/report.json"), key=lambda p: p.stat().st_mtime)
     if not reports:
         return "failed", f"no report (nixpkgs-review exited with {code}): {failure_line(jobdir)}", None
     data = json.loads(reports[-1].read_text())
@@ -243,6 +287,8 @@ def run_review(job: sqlite3.Row, settings: dict[str, str]) -> tuple[str, str, st
         failed += len(result.get("failed", []))
         counts = ", ".join(f"{len(attrs)} {kind}" for kind, attrs in result.items() if attrs)
         parts.append(f"{system}: {counts or 'nothing to build'}")
+    if eval_mode == "local":
+        parts.append("local eval")
     # nixpkgs-review --no-shell exits 1 when a package failed to build.
     status = "success" if code == 0 and failed == 0 else "failed"
     return status, "; ".join(parts), data.get("commit")

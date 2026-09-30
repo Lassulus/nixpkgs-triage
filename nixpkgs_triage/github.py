@@ -155,8 +155,9 @@ class GitHub:
             return data
 
     def get(self, path: str, accept: str = "application/vnd.github+json") -> bytes:
-        """REST GET, e.g. get("/repos/NixOS/nixpkgs/pulls/1", "application/vnd.github.diff")."""
-        return self._send(f"https://api.github.com{path}", None, accept)[1]
+        """REST GET of an API path or full API URL, e.g. get("/repos/NixOS/nixpkgs/pulls/1", "application/vnd.github.diff")."""
+        url = path if path.startswith("https://") else f"https://api.github.com{path}"
+        return self._send(url, None, accept)[1]
 
 
 def github_token() -> str:
