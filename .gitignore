@@ -1,3 +1,6 @@
 /triage.db
 /triage.db-journal
+/triage.db-wal
+/triage.db-shm
+/jobs/
 __pycache__/
