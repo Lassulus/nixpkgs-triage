@@ -1,0 +1,128 @@
+# PR categories, derived from nixpkgs' own labels (8.has:*, 4.workflow:*, 10.rebuild-*, ...)
+# plus title/path conventions for PRs the label bot hasn't handled.
+#
+# A category matches when ANY of its criteria matches:
+#   labels      - PR carries one of these exact labels
+#   authors     - PR author login
+#   title       - regex searched in the title
+#   base        - regex searched in the base branch name
+#   files_any   - regex; some changed file matches
+#   files_added - regex; some *added* file matches
+#   files_all   - regex; every changed file matches (only if the full file list (<=100) is known)
+#
+# Order matters: the first match is the PR's primary category (the review queue it lands in),
+# every match is kept as a tag (`triage list --tag nixos-module`).
+# Editing this file re-categorizes the local database on the next `triage` invocation, no API calls.
+
+fallback = "other"
+topic_label_prefix = "6.topic: "
+
+[[category]]
+name = "security"
+description = "Security fixes"
+labels = ["1.severity: security"]
+title = '(?i)\bCVE-\d{4}-\d+|\bGHSA-|\bvulnerab|\bsecurity (fix|patch|update|release)'
+
+[[category]]
+name = "backport"
+description = "Targets a stable release branch"
+labels = ["4.workflow: backport"]
+base = '^(release|staging|staging-next|staging-nixos)-\d+\.\d+$'
+title = '^\[Backport '
+
+[[category]]
+name = "mass-rebuild"
+description = "Staging / package-set branches and PRs rebuilding 500+ packages"
+labels = [
+  "4.workflow: staging",
+  "4.workflow: package set update",
+  "10.rebuild-linux-stdenv",
+  "10.rebuild-darwin-stdenv",
+  "10.rebuild-nixos-tests",
+  "10.rebuild-linux: 501+",
+  "10.rebuild-linux: 501-1000",
+  "10.rebuild-linux: 1001-2500",
+  "10.rebuild-linux: 2501-5000",
+  "10.rebuild-linux: 5001+",
+]
+base = '^(staging|staging-next|staging-nixos|haskell-updates|python-updates)$'
+
+[[category]]
+name = "nixos-module-new"
+description = "New NixOS module / service"
+labels = ["8.has: module (new)"]
+title = '^nixos/(?!tests/)[^:]+: (init|add module)\b'
+# new modules must be registered here; refactors that touch it are rare
+files_any = '^nixos/modules/module-list\.nix$'
+
+[[category]]
+name = "new-package"
+description = "New package"
+labels = ["8.has: package (new)"]
+title = '(?i)\binit at\b'
+
+[[category]]
+name = "treewide"
+description = "Tree-wide refactors and mass changes"
+title = '(?i)^treewide\b'
+
+[[category]]
+name = "docs"
+description = "Documentation only"
+files_all = '(^doc/|^nixos/doc/|\.md$)'
+
+[[category]]
+name = "maintainers"
+description = "Only maintainer / team list changes"
+files_all = '^maintainers/(maintainer-list|team-list)\.nix$'
+
+[[category]]
+name = "nixos-test"
+description = "Only NixOS tests changed"
+files_all = '^nixos/tests/'
+
+[[category]]
+name = "package-update-bot"
+description = "Automated version bumps by r-ryantm"
+authors = ["r-ryantm"]
+
+[[category]]
+name = "package-update"
+description = "Manual version bumps"
+labels = ["8.has: package (update)"]
+title = '->|→|(?i:\bupdate to\b|\bbump\b)'
+
+[[category]]
+name = "nixos-module"
+description = "Changes to existing NixOS modules / services"
+labels = ["8.has: module (update)"]
+title = '^nixos/'
+files_any = '^nixos/modules/'
+
+[[category]]
+name = "removal"
+description = "Package / module removals and clean-ups"
+labels = ["8.has: clean-up"]
+title = '(?i)\b(drop|remove|removal|deprecate)\b'
+
+[[category]]
+name = "ci-tooling"
+description = "CI, GitHub workflows, maintainer scripts"
+labels = ["6.topic: continuous integration", "github_actions"]
+files_all = '^(\.github/|ci/|maintainers/scripts/|\.editorconfig$|\.git-blame-ignore-revs$)'
+
+[[category]]
+name = "lib"
+description = "Nixpkgs library (lib/)"
+title = '^lib[./:]'
+files_all = '^(lib/|flake\.nix$)'
+
+[[category]]
+name = "package-fix"
+description = "Other package changes (build fixes, options, refactors)"
+files_any = '^pkgs/'
+
+[[category]]
+name = "nixos-other"
+description = "NixOS infrastructure outside modules (test driver, image builders, release)"
+files_any = '^nixos/'

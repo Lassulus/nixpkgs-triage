@@ -1,0 +1,800 @@
+#!/usr/bin/env python3
+"""nixpkgs PR triage: mirror open NixOS/nixpkgs PRs into SQLite, categorize them, track local review state."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+import tomllib
+import urllib.error
+import urllib.request
+import webbrowser
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+DB_PATH = Path(os.environ.get("TRIAGE_DB", ROOT / "triage.db"))
+CATEGORIES_PATH = Path(os.environ.get("TRIAGE_CATEGORIES", ROOT / "categories.toml"))
+OWNER, REPO = "NixOS", "nixpkgs"
+API_URL = "https://api.github.com/graphql"
+
+# Incremental syncs re-read this much before the previous watermark to absorb clock skew.
+SYNC_OVERLAP = timedelta(minutes=5)
+MIN_PAGE_SIZE = 5
+REVIEW_STATUSES = ("todo", "reviewing", "done", "skip")
+BLOCKING_LABELS = ("2.status: merge conflict", "2.status: needs-changes")
+
+PR_FRAGMENT = """
+fragment PR on PullRequest {
+  id number title state isDraft createdAt updatedAt closedAt mergedAt
+  baseRefName additions deletions changedFiles reviewDecision authorAssociation
+  author { login }
+  labels(first: 50) { nodes { name } }
+  files(first: 100) { totalCount nodes { path changeType } }
+  commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+  comments { totalCount }
+}
+"""
+
+PAGE_QUERY = """
+query($owner: String!, $repo: String!, $n: Int!, $after: String, $states: [PullRequestState!], $order: IssueOrder!) {
+  rateLimit { cost remaining resetAt }
+  repository(owner: $owner, name: $repo) {
+    pullRequests(first: $n, after: $after, states: $states, orderBy: $order) {
+      totalCount
+      pageInfo { hasNextPage endCursor }
+      nodes { ...PR }
+    }
+  }
+}
+""" + PR_FRAGMENT
+
+NODES_QUERY = """
+query($ids: [ID!]!) {
+  rateLimit { cost remaining resetAt }
+  nodes(ids: $ids) { ...PR }
+}
+""" + PR_FRAGMENT
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS prs (
+  number INTEGER PRIMARY KEY,
+  node_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  author TEXT,
+  author_association TEXT,
+  state TEXT NOT NULL,
+  is_draft INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  closed_at TEXT,
+  merged_at TEXT,
+  base_ref TEXT,
+  additions INTEGER,
+  deletions INTEGER,
+  changed_files INTEGER,
+  review_decision TEXT,
+  ci_state TEXT,
+  comments INTEGER,
+  labels TEXT NOT NULL,
+  files TEXT NOT NULL,
+  files_total INTEGER,
+  category TEXT,
+  tags TEXT,
+  topics TEXT,
+  seen_run TEXT,
+  synced_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS prs_state_category ON prs(state, category);
+CREATE TABLE IF NOT EXISTS reviews (
+  number INTEGER PRIMARY KEY,
+  status TEXT NOT NULL,
+  note TEXT,
+  marked_at TEXT NOT NULL,
+  pr_updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+"""
+
+
+def log(msg: str) -> None:
+    print(f"[{datetime.now():%H:%M:%S}] {msg}", file=sys.stderr, flush=True)
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def iso(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_ts(s: str) -> datetime:
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+# --------------------------------------------------------------------------- GitHub client
+
+
+class ServerTimeout(Exception):
+    """GitHub aborted the query (502/504); the caller should shrink the page."""
+
+
+class GitHub:
+    """Serial GraphQL client that stays below both the primary and secondary rate limits.
+
+    - primary (5000 points/h): every query asks for `rateLimit`; below `reserve` we sleep until reset.
+    - secondary (concurrency / CPU time): requests are strictly serial with `delay` seconds between
+      them; 403/429 responses honour `Retry-After`, otherwise back off exponentially.
+    """
+
+    def __init__(self, token: str, delay: float, reserve: int):
+        self.token = token
+        self.delay = delay
+        self.reserve = reserve
+        self.last_request = 0.0
+        self.points_used = 0
+        self.requests = 0
+
+    def _sleep(self, seconds: float, why: str) -> None:
+        seconds = max(1.0, seconds)
+        log(f"{why}; sleeping {seconds:.0f}s")
+        time.sleep(seconds)
+
+    def _sleep_until_epoch(self, reset: float, why: str) -> None:
+        self._sleep(reset - time.time() + 5, why)
+
+    def query(self, query: str, variables: dict) -> dict:
+        body = json.dumps({"query": query, "variables": variables}).encode()
+        backoff = 0
+        network_failures = 0
+        while True:
+            wait = self.last_request + self.delay - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            self.last_request = time.monotonic()
+            self.requests += 1
+            req = urllib.request.Request(
+                API_URL,
+                data=body,
+                headers={
+                    "Authorization": f"bearer {self.token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "nixpkgs-triage",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=90) as resp:
+                    headers = resp.headers
+                    payload = json.load(resp)
+            except urllib.error.HTTPError as e:
+                if e.code in (502, 504):
+                    raise ServerTimeout(f"HTTP {e.code}") from None
+                if e.code == 401:
+                    sys.exit("GitHub rejected the token (401). Run `gh auth login` or set GITHUB_TOKEN.")
+                if e.code in (403, 429):
+                    retry_after = e.headers.get("retry-after")
+                    if retry_after:
+                        self._sleep(int(retry_after) + 1, f"HTTP {e.code} with Retry-After")
+                    elif e.headers.get("x-ratelimit-remaining") == "0":
+                        self._sleep_until_epoch(int(e.headers["x-ratelimit-reset"]), "primary rate limit exhausted")
+                    else:
+                        self._sleep(min(60 * 2**backoff, 900), f"secondary rate limit (HTTP {e.code})")
+                        backoff += 1
+                    continue
+                if e.code >= 500 and network_failures < 5:
+                    network_failures += 1
+                    self._sleep(10 * network_failures, f"HTTP {e.code}")
+                    continue
+                raise
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+                if network_failures >= 5:
+                    raise
+                network_failures += 1
+                self._sleep(10 * network_failures, f"network error: {e}")
+                continue
+
+            errors = payload.get("errors") or []
+            if any(err.get("type") == "RATE_LIMITED" for err in errors):
+                self._sleep_until_epoch(int(headers.get("x-ratelimit-reset", time.time() + 60)), "GraphQL RATE_LIMITED")
+                continue
+            data = payload.get("data")
+            if data is None:
+                raise RuntimeError(f"GraphQL error: {errors}")
+
+            rl = data.get("rateLimit")
+            if rl:
+                self.points_used += rl["cost"]
+                if rl["remaining"] < self.reserve:
+                    reset = parse_ts(rl["resetAt"]).timestamp()
+                    self._sleep_until_epoch(reset, f"only {rl['remaining']} points left (reserve {self.reserve})")
+            return data
+
+
+def github_token() -> str:
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        return token
+    if shutil.which("gh"):
+        out = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True)
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    sys.exit("No GitHub token: set GITHUB_TOKEN or log in with `gh auth login`.")
+
+
+# --------------------------------------------------------------------------- categorization
+
+
+class Categorizer:
+    """Rules from categories.toml. A category matches if ANY of its criteria matches;
+    the first matching category (file order) is the primary one, all matches become tags."""
+
+    def __init__(self, path: Path):
+        raw = path.read_bytes()
+        self.digest = hashlib.sha256(raw).hexdigest()
+        cfg = tomllib.loads(raw.decode())
+        self.fallback = cfg.get("fallback", "other")
+        self.topic_prefix = cfg.get("topic_label_prefix", "6.topic: ")
+        self.categories = []
+        for c in cfg["category"]:
+            self.categories.append(
+                {
+                    "name": c["name"],
+                    "description": c.get("description", ""),
+                    "labels": set(c.get("labels", [])),
+                    "authors": set(c.get("authors", [])),
+                    **{
+                        key: re.compile(c[key])
+                        for key in ("title", "base", "files_any", "files_added", "files_all")
+                        if key in c
+                    },
+                }
+            )
+        self.names = [c["name"] for c in self.categories] + [self.fallback]
+
+    @staticmethod
+    def _matches(c: dict, pr: dict) -> bool:
+        files = pr["files"]
+        if c["labels"] & set(pr["labels"]):
+            return True
+        if pr["author"] in c["authors"]:
+            return True
+        if "title" in c and c["title"].search(pr["title"]):
+            return True
+        if "base" in c and c["base"].search(pr["base_ref"] or ""):
+            return True
+        if "files_any" in c and any(c["files_any"].search(p) for p, _ in files):
+            return True
+        if "files_added" in c and any(t == "ADDED" and c["files_added"].search(p) for p, t in files):
+            return True
+        # Only trust "all files" rules when we saw the complete file list.
+        if "files_all" in c and files and len(files) >= (pr["files_total"] or 0):
+            if all(c["files_all"].search(p) for p, _ in files):
+                return True
+        return False
+
+    def classify(self, pr: dict) -> tuple[str, list[str], list[str]]:
+        tags = [c["name"] for c in self.categories if self._matches(c, pr)]
+        topics = sorted(l[len(self.topic_prefix):] for l in pr["labels"] if l.startswith(self.topic_prefix))
+        return (tags[0] if tags else self.fallback), tags, topics
+
+
+# --------------------------------------------------------------------------- database
+
+
+def open_db() -> sqlite3.Connection:
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    db.executescript(SCHEMA)
+    return db
+
+
+def meta_get(db: sqlite3.Connection, key: str) -> str | None:
+    row = db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def meta_set(db: sqlite3.Connection, key: str, value: str | None) -> None:
+    if value is None:
+        db.execute("DELETE FROM meta WHERE key = ?", (key,))
+    else:
+        db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (key, value))
+
+
+def node_to_row(node: dict) -> dict:
+    commits = node["commits"]["nodes"]
+    rollup = commits[0]["commit"]["statusCheckRollup"] if commits else None
+    return {
+        "number": node["number"],
+        "node_id": node["id"],
+        "title": node["title"],
+        "author": (node.get("author") or {}).get("login"),
+        "author_association": node["authorAssociation"],
+        "state": node["state"],
+        "is_draft": int(node["isDraft"]),
+        "created_at": node["createdAt"],
+        "updated_at": node["updatedAt"],
+        "closed_at": node["closedAt"],
+        "merged_at": node["mergedAt"],
+        "base_ref": node["baseRefName"],
+        "additions": node["additions"],
+        "deletions": node["deletions"],
+        "changed_files": node["changedFiles"],
+        "review_decision": node["reviewDecision"],
+        "ci_state": rollup["state"] if rollup else None,
+        "comments": node["comments"]["totalCount"],
+        "labels": [l["name"] for l in node["labels"]["nodes"]],
+        "files": [(f["path"], f["changeType"]) for f in node["files"]["nodes"]],
+        "files_total": node["files"]["totalCount"],
+    }
+
+
+def upsert(db: sqlite3.Connection, cat: Categorizer, node: dict, seen_run: str | None = None) -> None:
+    row = node_to_row(node)
+    row["category"], tags, topics = cat.classify(row)
+    row["tags"] = json.dumps(tags)
+    row["topics"] = json.dumps(topics)
+    row["labels"] = json.dumps(row["labels"])
+    row["files"] = json.dumps(row["files"])
+    row["seen_run"] = seen_run
+    row["synced_at"] = iso(utcnow())
+    cols = list(row)
+    updates = ", ".join(
+        f"{c} = excluded.{c}" if c != "seen_run" else "seen_run = COALESCE(excluded.seen_run, prs.seen_run)"
+        for c in cols
+        if c != "number"
+    )
+    db.execute(
+        f"INSERT INTO prs ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)}) "
+        f"ON CONFLICT(number) DO UPDATE SET {updates}",
+        [row[c] for c in cols],
+    )
+
+
+def recategorize(db: sqlite3.Connection, cat: Categorizer) -> int:
+    rows = db.execute("SELECT number, title, author, base_ref, labels, files, files_total FROM prs").fetchall()
+    for r in rows:
+        pr = dict(r)
+        pr["labels"] = json.loads(pr["labels"])
+        pr["files"] = json.loads(pr["files"])
+        primary, tags, topics = cat.classify(pr)
+        db.execute(
+            "UPDATE prs SET category = ?, tags = ?, topics = ? WHERE number = ?",
+            (primary, json.dumps(tags), json.dumps(topics), r["number"]),
+        )
+    meta_set(db, "categories_digest", cat.digest)
+    db.commit()
+    return len(rows)
+
+
+def load_categorizer(db: sqlite3.Connection) -> Categorizer:
+    """Load categories.toml and re-apply it to stored PRs if the file changed since last run."""
+    cat = Categorizer(CATEGORIES_PATH)
+    if meta_get(db, "categories_digest") != cat.digest:
+        n = recategorize(db, cat)
+        if n:
+            log(f"categories.toml changed; recategorized {n} PRs")
+    return cat
+
+
+# --------------------------------------------------------------------------- sync
+
+
+def paginate(gh: GitHub, variables: dict, page_size: int, after: str | None):
+    """Yield (connection, cursor_after_page). Halves the page size when GitHub times out."""
+    size = page_size
+    good_pages = 0
+    failures = 0
+    while True:
+        try:
+            data = gh.query(PAGE_QUERY, {**variables, "n": size, "after": after})
+        except ServerTimeout as e:
+            failures += 1
+            if size == MIN_PAGE_SIZE and failures > 5:
+                raise RuntimeError("GitHub keeps timing out even at the minimum page size") from e
+            size = max(MIN_PAGE_SIZE, size // 2)
+            log(f"{e}: server timeout, retrying with page size {size}")
+            continue
+        failures = 0
+        good_pages += 1
+        if size < page_size and good_pages >= 3:
+            size = min(page_size, size * 2)
+            good_pages = 0
+        conn = data["repository"]["pullRequests"]
+        after = conn["pageInfo"]["endCursor"]
+        yield conn, after
+        if not conn["pageInfo"]["hasNextPage"]:
+            return
+
+
+def sync_full(gh: GitHub, db: sqlite3.Connection, cat: Categorizer, page_size: int) -> None:
+    """Page through all open PRs (oldest first, stable cursor). Resumable after interruption."""
+    run = meta_get(db, "full_sync_run")
+    cursor = meta_get(db, "full_sync_cursor")
+    if run is None:
+        run = iso(utcnow())
+        meta_set(db, "full_sync_run", run)
+        db.commit()
+    if cursor is None:
+        log(f"full sync started (run {run})")
+    else:
+        log(f"resuming full sync of run {run}")
+    seen = db.execute("SELECT COUNT(*) FROM prs WHERE seen_run = ?", (run,)).fetchone()[0]
+    variables = {
+        "owner": OWNER,
+        "repo": REPO,
+        "states": ["OPEN"],
+        "order": {"field": "CREATED_AT", "direction": "ASC"},
+    }
+    for conn, cursor in paginate(gh, variables, page_size, cursor):
+        for node in conn["nodes"]:
+            upsert(db, cat, node, seen_run=run)
+        seen += len(conn["nodes"])
+        meta_set(db, "full_sync_cursor", cursor)
+        db.commit()
+        log(f"full sync: {seen}/{conn['totalCount']} open PRs, {gh.points_used} points used")
+
+    # PRs we still think are open but did not see were closed/merged meanwhile: refresh them.
+    missing = [
+        r["node_id"]
+        for r in db.execute("SELECT node_id FROM prs WHERE state = 'OPEN' AND seen_run IS NOT ?", (run,))
+    ]
+    if missing:
+        log(f"refreshing {len(missing)} PRs that are no longer in the open list")
+    for i in range(0, len(missing), 50):
+        data = gh.query(NODES_QUERY, {"ids": missing[i : i + 50]})
+        for node in data["nodes"]:
+            if node:
+                upsert(db, cat, node)
+        db.commit()
+    # Anything updated after the run started is picked up by the following incremental sync.
+    meta_set(db, "last_sync", run)
+    meta_set(db, "full_sync_run", None)
+    meta_set(db, "full_sync_cursor", None)
+    db.commit()
+    log("full sync complete")
+
+
+def sync_incremental(gh: GitHub, db: sqlite3.Connection, cat: Categorizer, page_size: int) -> None:
+    """Fetch PRs (any state) ordered by most recently updated, until we pass the previous watermark."""
+    since = parse_ts(meta_get(db, "last_sync")) - SYNC_OVERLAP
+    run_start = utcnow()
+    variables = {
+        "owner": OWNER,
+        "repo": REPO,
+        "states": None,
+        "order": {"field": "UPDATED_AT", "direction": "DESC"},
+    }
+    count = 0
+    done = False
+    for conn, _ in paginate(gh, variables, page_size, None):
+        for node in conn["nodes"]:
+            if parse_ts(node["updatedAt"]) < since:
+                done = True
+                break
+            upsert(db, cat, node)
+            count += 1
+        db.commit()
+        log(f"incremental: {count} PRs updated since {iso(since)}, {gh.points_used} points used")
+        if done:
+            break
+    # PRs updated while we were paging moved ahead of our cursor; the next run catches them.
+    meta_set(db, "last_sync", iso(run_start))
+    db.commit()
+
+
+def cmd_update(args: argparse.Namespace) -> None:
+    db = open_db()
+    cat = load_categorizer(db)
+    gh = GitHub(github_token(), delay=args.delay, reserve=args.reserve)
+    started = time.monotonic()
+    if args.full and meta_get(db, "full_sync_run") is None:
+        meta_set(db, "full_sync_run", iso(utcnow()))
+        db.commit()
+    if meta_get(db, "full_sync_run") is not None or meta_get(db, "last_sync") is None:
+        sync_full(gh, db, cat, args.page_size)
+    sync_incremental(gh, db, cat, args.page_size)
+    open_count = db.execute("SELECT COUNT(*) FROM prs WHERE state = 'OPEN'").fetchone()[0]
+    log(
+        f"done in {time.monotonic() - started:.0f}s: {gh.requests} requests, {gh.points_used} points; "
+        f"{open_count} open PRs in {DB_PATH}"
+    )
+
+
+# --------------------------------------------------------------------------- querying
+
+
+def add_filter_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("-c", "--category", action="append", help="primary category (repeatable)")
+    p.add_argument("--tag", action="append", help="any matching category, not only the primary one")
+    p.add_argument("-t", "--topic", action="append", help="6.topic label without prefix, e.g. python")
+    p.add_argument("-l", "--label", action="append", help="exact GitHub label")
+    p.add_argument("-a", "--author")
+    p.add_argument("-b", "--base", help="base branch")
+    p.add_argument("--drafts", action="store_true", help="include draft PRs")
+    p.add_argument("--ready", action="store_true", help="CI not failing, no merge conflict / needs-changes label")
+    p.add_argument("--max-size", type=int, help="max additions+deletions")
+    p.add_argument("-s", "--status", choices=("none", "stale", *REVIEW_STATUSES), action="append",
+                   help="local review status; 'stale' = marked done but PR changed since")
+    p.add_argument("--sort", choices=("updated", "oldest", "newest", "size"), default="updated")
+
+
+def build_query(args: argparse.Namespace) -> tuple[str, list]:
+    where = ["p.state = 'OPEN'"]
+    params: list = []
+    if not args.drafts:
+        where.append("p.is_draft = 0")
+    if args.category:
+        where.append(f"p.category IN ({', '.join('?' for _ in args.category)})")
+        params += args.category
+    for tag in args.tag or []:
+        where.append("EXISTS (SELECT 1 FROM json_each(p.tags) WHERE value = ?)")
+        params.append(tag)
+    for topic in args.topic or []:
+        where.append("EXISTS (SELECT 1 FROM json_each(p.topics) WHERE lower(value) = lower(?))")
+        params.append(topic)
+    for label in args.label or []:
+        where.append("EXISTS (SELECT 1 FROM json_each(p.labels) WHERE value = ?)")
+        params.append(label)
+    if args.author:
+        where.append("p.author = ?")
+        params.append(args.author)
+    if args.base:
+        where.append("p.base_ref = ?")
+        params.append(args.base)
+    if args.ready:
+        where.append("COALESCE(p.ci_state, '') NOT IN ('FAILURE', 'ERROR')")
+        where.append(
+            f"NOT EXISTS (SELECT 1 FROM json_each(p.labels) WHERE value IN ({', '.join('?' for _ in BLOCKING_LABELS)}))"
+        )
+        params += BLOCKING_LABELS
+    if args.max_size is not None:
+        where.append("p.additions + p.deletions <= ?")
+        params.append(args.max_size)
+    if args.status:
+        ors = []
+        for s in args.status:
+            if s == "none":
+                ors.append("r.status IS NULL")
+            elif s == "stale":
+                ors.append("(r.status = 'done' AND p.updated_at > r.pr_updated_at)")
+            else:
+                ors.append("r.status = ?")
+                params.append(s)
+        where.append(f"({' OR '.join(ors)})")
+    order = {
+        "updated": "p.updated_at DESC",
+        "oldest": "p.created_at ASC",
+        "newest": "p.created_at DESC",
+        "size": "p.additions + p.deletions ASC",
+    }[args.sort]
+    sql = (
+        "SELECT p.*, r.status AS review_status, r.note AS review_note, r.pr_updated_at AS reviewed_version "
+        "FROM prs p LEFT JOIN reviews r ON r.number = p.number "
+        f"WHERE {' AND '.join(where)} ORDER BY {order}"
+    )
+    return sql, params
+
+
+def age(ts: str) -> str:
+    days = (utcnow() - parse_ts(ts)).days
+    if days >= 365:
+        return f"{days // 365}y"
+    if days >= 30:
+        return f"{days // 30}mo"
+    return f"{days}d"
+
+
+def review_marker(r: sqlite3.Row) -> str:
+    if not r["review_status"]:
+        return ""
+    stale = r["reviewed_version"] and r["updated_at"] > r["reviewed_version"]
+    return r["review_status"] + ("*" if stale else "")
+
+
+CI_SHORT = {"SUCCESS": "ok", "FAILURE": "FAIL", "ERROR": "ERR", "PENDING": "..", "EXPECTED": ".."}
+
+
+def print_rows(rows: list[sqlite3.Row]) -> None:
+    width = shutil.get_terminal_size((160, 20)).columns
+    for r in rows:
+        topics = ",".join(json.loads(r["topics"]))
+        prefix = (
+            f"#{r['number']:<7} {r['category']:<18.18} {topics:<12.12} "
+            f"+{r['additions']}/-{r['deletions']:<6} {age(r['created_at']):>4} "
+            f"{CI_SHORT.get(r['ci_state'] or '', '-'):<4} {review_marker(r):<10} "
+        )
+        print((prefix + r["title"])[:width])
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    db = open_db()
+    load_categorizer(db)
+    sql, params = build_query(args)
+    rows = db.execute(sql + " LIMIT ?", [*params, args.limit]).fetchall()
+    if args.json:
+        out = []
+        for r in rows:
+            d = dict(r)
+            for k in ("labels", "files", "tags", "topics"):
+                d[k] = json.loads(d[k])
+            out.append(d)
+        json.dump(out, sys.stdout, indent=2)
+        print()
+    else:
+        print_rows(rows)
+
+
+def cmd_next(args: argparse.Namespace) -> None:
+    db = open_db()
+    load_categorizer(db)
+    if not args.status:
+        args.status = ["none", "todo", "stale"]
+    sql, params = build_query(args)
+    row = db.execute(sql + " LIMIT 1", params).fetchone()
+    if row is None:
+        sys.exit("nothing left in this queue")
+    show(db, row["number"])
+    if args.open:
+        webbrowser.open(f"https://github.com/{OWNER}/{REPO}/pull/{row['number']}")
+
+
+def show(db: sqlite3.Connection, number: int) -> None:
+    r = db.execute(
+        "SELECT p.*, r.status AS review_status, r.note AS review_note, r.marked_at, r.pr_updated_at AS reviewed_version "
+        "FROM prs p LEFT JOIN reviews r ON r.number = p.number WHERE p.number = ?",
+        (number,),
+    ).fetchone()
+    if r is None:
+        sys.exit(f"#{number} is not in the database (run `triage update`)")
+    files = json.loads(r["files"])
+    print(f"#{r['number']} {r['title']}")
+    print(f"  https://github.com/{OWNER}/{REPO}/pull/{r['number']}")
+    print(f"  state:     {r['state']}{' (draft)' if r['is_draft'] else ''} -> {r['base_ref']}")
+    print(f"  author:    {r['author']} ({r['author_association']})")
+    print(f"  created:   {r['created_at']} ({age(r['created_at'])} ago), updated {r['updated_at']}")
+    print(f"  category:  {r['category']}  tags: {', '.join(json.loads(r['tags'])) or '-'}")
+    print(f"  topics:    {', '.join(json.loads(r['topics'])) or '-'}")
+    print(f"  size:      +{r['additions']}/-{r['deletions']} in {r['files_total']} files, {r['comments']} comments")
+    print(f"  CI:        {r['ci_state'] or '-'}   review decision: {r['review_decision'] or '-'}")
+    print(f"  labels:    {', '.join(json.loads(r['labels'])) or '-'}")
+    if r["review_status"]:
+        print(f"  local:     {review_marker(r)} (marked {r['marked_at']}){': ' + r['review_note'] if r['review_note'] else ''}")
+    print("  files:")
+    for path, change in files[:25]:
+        print(f"    {change[0]} {path}")
+    if r["files_total"] > 25:
+        print(f"    ... {r['files_total'] - 25} more")
+
+
+def cmd_show(args: argparse.Namespace) -> None:
+    db = open_db()
+    load_categorizer(db)
+    show(db, args.number)
+    if args.open:
+        webbrowser.open(f"https://github.com/{OWNER}/{REPO}/pull/{args.number}")
+
+
+def cmd_mark(args: argparse.Namespace) -> None:
+    db = open_db()
+    for number in args.numbers:
+        row = db.execute("SELECT updated_at FROM prs WHERE number = ?", (number,)).fetchone()
+        if row is None:
+            sys.exit(f"#{number} is not in the database (run `triage update`)")
+        if args.status == "clear":
+            db.execute("DELETE FROM reviews WHERE number = ?", (number,))
+        else:
+            db.execute(
+                "INSERT OR REPLACE INTO reviews(number, status, note, marked_at, pr_updated_at) VALUES (?, ?, ?, ?, ?)",
+                (number, args.status, args.note, iso(utcnow()), row["updated_at"]),
+            )
+    db.commit()
+
+
+def cmd_stats(args: argparse.Namespace) -> None:
+    db = open_db()
+    cat = load_categorizer(db)
+    last = meta_get(db, "last_sync")
+    print(f"last sync: {last or 'never'}")
+    if args.by == "topic":
+        key_sql = "COALESCE(t.value, '(none)')"
+        source = "prs p LEFT JOIN json_each(p.topics) t"
+    else:
+        key_sql = f"p.{args.by}"
+        source = "prs p"
+    rows = db.execute(
+        f"""
+        SELECT {key_sql} AS grp,
+               SUM(p.is_draft = 0) AS open,
+               SUM(p.is_draft = 1) AS drafts,
+               SUM(p.is_draft = 0 AND COALESCE(p.ci_state, '') NOT IN ('FAILURE', 'ERROR')
+                   AND NOT EXISTS (SELECT 1 FROM json_each(p.labels) l
+                                   WHERE l.value IN ({', '.join('?' for _ in BLOCKING_LABELS)}))) AS ready,
+               SUM(r.status = 'done') AS done,
+               SUM(r.status = 'skip') AS skipped
+        FROM {source} LEFT JOIN reviews r ON r.number = p.number
+        WHERE p.state = 'OPEN'
+        GROUP BY grp
+        """,
+        BLOCKING_LABELS,
+    ).fetchall()
+    if args.by == "category":
+        order = {n: i for i, n in enumerate(cat.names)}
+        rows.sort(key=lambda r: order.get(r["grp"], len(order)))
+    else:
+        rows.sort(key=lambda r: -(r["open"] + r["drafts"]))
+        rows = rows[: args.limit]
+    print(f"{args.by:<24} {'open':>6} {'drafts':>6} {'ready':>6} {'done':>6} {'skip':>6}")
+    totals = [0] * 5
+    for r in rows:
+        vals = [r["open"], r["drafts"], r["ready"], r["done"] or 0, r["skipped"] or 0]
+        totals = [a + b for a, b in zip(totals, vals)]
+        print(f"{str(r['grp']):<24.24} " + " ".join(f"{v:>6}" for v in vals))
+    if args.by == "category":
+        print(f"{'total':<24} " + " ".join(f"{v:>6}" for v in totals))
+
+
+def cmd_recategorize(args: argparse.Namespace) -> None:
+    db = open_db()
+    n = recategorize(db, Categorizer(CATEGORIES_PATH))
+    log(f"recategorized {n} PRs")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="triage", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("update", help="sync the local database with GitHub")
+    p.add_argument("--full", action="store_true", help="re-walk all open PRs (first run does this automatically)")
+    p.add_argument("--page-size", type=int, default=50, help="PRs per request; shrinks automatically on timeouts")
+    p.add_argument("--delay", type=float, default=1.0, help="seconds between requests (secondary rate limit)")
+    p.add_argument("--reserve", type=int, default=500, help="stop and wait for reset below this many points")
+    p.set_defaults(func=cmd_update)
+
+    p = sub.add_parser("stats", help="counts per category / topic")
+    p.add_argument("--by", choices=("category", "topic", "author", "base_ref"), default="category")
+    p.add_argument("--limit", type=int, default=40)
+    p.set_defaults(func=cmd_stats)
+
+    p = sub.add_parser("list", help="list open PRs")
+    add_filter_args(p)
+    p.add_argument("-n", "--limit", type=int, default=50)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("next", help="show the next PR to review in a queue")
+    add_filter_args(p)
+    p.add_argument("-o", "--open", action="store_true", help="open it in the browser")
+    p.set_defaults(func=cmd_next)
+
+    p = sub.add_parser("show", help="show one PR")
+    p.add_argument("number", type=int)
+    p.add_argument("-o", "--open", action="store_true", help="open it in the browser")
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("mark", help="set local review status")
+    p.add_argument("status", choices=(*REVIEW_STATUSES, "clear"))
+    p.add_argument("numbers", type=int, nargs="+")
+    p.add_argument("-m", "--note")
+    p.set_defaults(func=cmd_mark)
+
+    p = sub.add_parser("recategorize", help="re-apply categories.toml to all stored PRs")
+    p.set_defaults(func=cmd_recategorize)
+
+    args = ap.parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        sys.exit("interrupted (progress is saved; rerun to resume)")
+
+
+if __name__ == "__main__":
+    main()
