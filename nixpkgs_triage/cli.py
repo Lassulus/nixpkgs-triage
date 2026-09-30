@@ -20,6 +20,7 @@ from .query import (
     cmd_stats,
 )
 from .runner import cmd_job_run
+from .settings import cmd_settings
 from .sync import cmd_update
 from .ui import cmd_ui
 from .util import TriageError
@@ -88,6 +89,12 @@ def main() -> None:
     p.add_argument("number", type=int)
     p.add_argument("-y", "--yes", action="store_true", help="don't ask for confirmation")
     p.set_defaults(func=cmd_post)
+
+    p = sub.add_parser("settings", help="show or change job settings (agent, model, nixpkgs-review command, …)")
+    p.add_argument("key", nargs="?", help="setting to show or change; all are listed without one")
+    p.add_argument("value", nargs="?", help="new value")
+    p.add_argument("--reset", action="store_true", help="go back to the default")
+    p.set_defaults(func=cmd_settings)
 
     p = sub.add_parser("job-run")  # internal: the detached runner started by check/review
     p.add_argument("job_id", type=int)

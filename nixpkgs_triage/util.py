@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
 import webbrowser
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .config import OWNER, REPO
 
@@ -71,3 +73,10 @@ def open_url(url: str) -> None:
         )
     else:
         webbrowser.open(url)
+
+
+def read_tail(path: Path, limit: int) -> str:
+    """The last `limit` bytes of a (log) file as text."""
+    with open(path, "rb") as f:
+        f.seek(max(0, f.seek(0, os.SEEK_END) - limit))
+        return f.read().decode(errors="replace")

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import shlex
 import shutil
 import signal
 import sqlite3
@@ -13,29 +12,18 @@ import sys
 from datetime import timedelta
 from pathlib import Path
 
-from .config import ENTRY, JOBS_DIR, NIXPKGS_DIR, ROOT
+from .config import ENTRY, JOBS_DIR, ROOT
 from .db import open_db
 from .github import ADD_COMMENT_MUTATION, GitHub, github_token
+from .settings import agent_argv, load_settings, nixpkgs_dir, review_argv
 from .util import TriageError, fmt_duration, iso, parse_ts, pr_url, since, utcnow
 
-JOB_TITLES = {"check": "guideline check (omp)", "review": "nixpkgs-review"}
+JOB_TITLES = {"check": "guideline check", "review": "nixpkgs-review"}
 
 ACTIVE_JOB_STATES = ("pending", "running")
 
 # Runners started by this process; polled so finished ones don't linger as zombies.
 SPAWNED: list[subprocess.Popen] = []
-
-
-def omp_command() -> list[str]:
-    return shlex.split(os.environ.get("TRIAGE_OMP", "omp"))
-
-
-def nixpkgs_review_command() -> list[str]:
-    if cmd := os.environ.get("TRIAGE_NIXPKGS_REVIEW"):
-        return shlex.split(cmd)
-    if shutil.which("nixpkgs-review"):
-        return ["nixpkgs-review"]
-    return ["nix", "run", "nixpkgs#nixpkgs-review", "--"]
 
 
 def runner_alive(pid: int) -> bool:
@@ -131,13 +119,13 @@ def start_job(db: sqlite3.Connection, number: int, kind: str) -> int:
     ).fetchone()
     if active:
         raise TriageError(f"{JOB_TITLES[kind]} for #{number} is already {active['status']}")
-    if kind == "review" and not (NIXPKGS_DIR / ".git").exists():
-        raise TriageError(f"nixpkgs-review needs a nixpkgs git checkout at {NIXPKGS_DIR} (set TRIAGE_NIXPKGS)")
-    tool, env_var = (
-        (omp_command()[0], "TRIAGE_OMP") if kind == "check" else (nixpkgs_review_command()[0], "TRIAGE_NIXPKGS_REVIEW")
-    )
+    settings = load_settings(db)
+    checkout = nixpkgs_dir(settings)
+    if kind == "review" and not (checkout / ".git").exists():
+        raise TriageError(f"nixpkgs-review needs a nixpkgs git checkout at {checkout} (see settings)")
+    tool = (agent_argv(settings) if kind == "check" else review_argv(settings, number))[0]
     if not shutil.which(tool):
-        raise TriageError(f"`{tool}` not found in PATH (set {env_var})")
+        raise TriageError(f"`{tool}` not found in PATH (see settings)")
 
     job_id = db.execute(
         "INSERT INTO jobs (number, kind, status, dir, created_at) VALUES (?, ?, 'pending', '', ?)",

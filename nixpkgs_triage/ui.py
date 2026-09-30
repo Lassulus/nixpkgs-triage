@@ -34,7 +34,8 @@ from .jobs import (
     start_job,
 )
 from .query import ci_label, review_marker
-from .util import TriageError, age, open_url, pr_url, since
+from .settings import SETTINGS, load_settings, save_setting, stored_settings
+from .util import TriageError, age, open_url, pr_url, read_tail, since
 
 
 class SyncJob:
@@ -74,7 +75,11 @@ UI_SORTS = (("oldest", "created_at", False), ("newest", "created_at", True), ("u
 # PR, age, CI, draft, mark, check, nixrev, title
 UI_PR_FORMAT = " {:<8} {:>4} {:<7} {:<5} {:<6.6} {:<7} {:<7} {}"
 
-UI_HELP = "tab/←→ pane  enter open  space details  c check  n nixpkgs-review  d drafts  o sort  R refresh  q quit"
+UI_HELP = (
+    "tab/←→ pane  enter open  space details  c check  n nixpkgs-review  d drafts  o sort  R refresh  S settings  q quit"
+)
+UI_SETTINGS_HELP = "↑↓ select  enter edit  r reset to default  q back"
+UI_EDIT_HELP = "enter save  esc cancel  ←→ home end ctrl-u"
 
 UI_DETAIL_HELP = (
     "c check  n nixpkgs-review  tab switch output  l log/report  x cancel  P post review  enter open  q back"
@@ -83,14 +88,6 @@ UI_DETAIL_HELP = (
 JOB_POLL_SECONDS = 2.0
 
 LOG_TAIL_BYTES = 512 * 1024
-
-
-def read_tail(path: Path, limit: int) -> str:
-    with open(path, "rb") as f:
-        f.seek(0, os.SEEK_END)
-        size = f.tell()
-        f.seek(max(0, size - limit))
-        return f.read().decode(errors="replace")
 
 
 class TriageUI:
@@ -119,6 +116,9 @@ class TriageUI:
         # detail view state: pr row, output tab ("check"/"review"), log instead of report, scroll (None = auto)
         self.detail: dict | None = None
         self.confirm: tuple[str, Callable[[], None]] | None = None
+        self.settings_idx = 0
+        # settings editor: {"key", "label", "buffer", "pos"} while a value is being edited
+        self.edit: dict | None = None
 
         curses.curs_set(0)
         scr.keypad(True)
@@ -211,11 +211,40 @@ class TriageUI:
             self.draw_sync(h, w)
         elif self.view == "detail":
             self.draw_detail(h, w)
+        elif self.view == "settings":
+            self.draw_settings(h, w)
         else:
             self.draw_list(h, w)
         if self.confirm:
             self.put(h - 1, 0, f" {self.confirm[0]} [y/N]", w, curses.A_REVERSE | curses.A_BOLD)
+        self.draw_edit(h, w)
         self.scr.refresh()
+
+    def draw_settings(self, h: int, w: int) -> None:
+        self.put(0, 0, " settings  (stored in triage.db; jobs read them when they start running)", w, curses.A_REVERSE)
+        values, stored = load_settings(self.db), stored_settings(self.db)
+        label_w = max(len(s.label) for s in SETTINGS) + 2
+        for i, s in enumerate(SETTINGS):
+            value = values[s.key] or "(empty)"
+            origin = "" if s.key in stored else "   (default)"
+            selected = i == self.settings_idx
+            line = f"{'▶' if selected else ' '} {s.label:<{label_w}} {value}{origin}"
+            self.put(2 + i, 0, line, w, curses.A_REVERSE if selected else curses.A_NORMAL)
+        self.put(3 + len(SETTINGS), 0, f"   {SETTINGS[self.settings_idx].help}", w, self.dim)
+        self.footer(h, w, UI_EDIT_HELP if self.edit else UI_SETTINGS_HELP)
+
+    def draw_edit(self, h: int, w: int) -> None:
+        """The one-line editor above the footer, with the terminal cursor at the edit position."""
+        if not self.edit:
+            curses.curs_set(0)
+            return
+        e = self.edit
+        prefix = f" {e['label']}: "
+        avail = max(1, w - len(prefix) - 1)
+        start = max(0, e["pos"] - avail + 1)  # scroll long values so the cursor stays visible
+        self.put(h - 2, 0, prefix + e["buffer"][start : start + avail], w, curses.A_BOLD)
+        curses.curs_set(1)
+        self.scr.move(h - 2, len(prefix) + e["pos"] - start)
 
     def footer(self, h: int, w: int, help_text: str) -> None:
         text = help_text
@@ -427,6 +456,54 @@ class TriageUI:
         again = f" (already posted {since(job['posted_at'])} ago)" if job["posted_at"] else ""
         self.confirm = (f"Post the nixpkgs-review report as a comment on #{number} on GitHub{again}?", do)
 
+    def handle_settings_key(self, key: int) -> None:
+        setting = SETTINGS[self.settings_idx]
+        if key in (ord("q"), 27):
+            self.view = "list"
+        elif key in (curses.KEY_UP, ord("k")):
+            self.settings_idx = max(0, self.settings_idx - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.settings_idx = min(len(SETTINGS) - 1, self.settings_idx + 1)
+        elif key in (10, 13, curses.KEY_ENTER):
+            value = load_settings(self.db)[setting.key]
+            self.edit = {"key": setting.key, "label": setting.label, "buffer": value, "pos": len(value)}
+        elif key == ord("r"):
+            save_setting(self.db, setting.key, None)
+            self.message = f"{setting.label} reset to default"
+
+    def handle_edit_key(self, key: str | int) -> None:
+        e = self.edit
+        buf, pos = e["buffer"], e["pos"]
+        if key in ("\n", "\r", curses.KEY_ENTER):
+            try:
+                warning = save_setting(self.db, e["key"], buf)
+            except TriageError as err:
+                self.message = str(err)  # keep editing so it can be fixed
+                return
+            self.message = f"saved {e['label']}" + (f", but {warning}" if warning else "")
+            self.edit = None
+            return
+        if key == "\x1b":
+            self.edit = None
+        elif key in ("\x7f", "\b", curses.KEY_BACKSPACE) and pos > 0:
+            buf, pos = buf[: pos - 1] + buf[pos:], pos - 1
+        elif key == curses.KEY_DC:
+            buf = buf[:pos] + buf[pos + 1 :]
+        elif key == curses.KEY_LEFT:
+            pos = max(0, pos - 1)
+        elif key == curses.KEY_RIGHT:
+            pos = min(len(buf), pos + 1)
+        elif key in (curses.KEY_HOME, "\x01"):
+            pos = 0
+        elif key in (curses.KEY_END, "\x05"):
+            pos = len(buf)
+        elif key == "\x15":  # ctrl-u
+            buf, pos = buf[pos:], 0
+        elif isinstance(key, str) and key.isprintable():
+            buf, pos = buf[:pos] + key + buf[pos:], pos + 1
+        if self.edit:
+            e["buffer"], e["pos"] = buf, pos
+
     # input
 
     def move(self, delta) -> None:
@@ -486,6 +563,8 @@ class TriageUI:
         elif key == ord("R"):
             self.start_sync()
             self.view = "sync"
+        elif key == ord("S"):
+            self.view = "settings"
         return True
 
     def handle_detail_key(self, key: int) -> None:
@@ -538,6 +617,15 @@ class TriageUI:
                 self.message = "refresh finished" if code == 0 else f"refresh failed (exit {code}), see R"
             self.poll_jobs()
             self.draw()
+            if self.edit:
+                try:
+                    wide_key = self.scr.get_wch()  # str for text (incl. non-ASCII), int for special keys
+                except curses.error:
+                    continue
+                if wide_key != curses.KEY_RESIZE:
+                    self.message = ""
+                    self.handle_edit_key(wide_key)
+                continue
             key = self.scr.getch()
             if key in (-1, curses.KEY_RESIZE):
                 continue
@@ -552,6 +640,8 @@ class TriageUI:
                 self.handle_sync_key(key)
             elif self.view == "detail":
                 self.handle_detail_key(key)
+            elif self.view == "settings":
+                self.handle_settings_key(key)
             elif not self.handle_list_key(key):
                 break
         if self.sync and self.sync.running:

@@ -19,11 +19,12 @@ import traceback
 import urllib.error
 from pathlib import Path
 
-from .config import JOB_SLOTS, JOBS_DIR, NIXPKGS_DIR, OWNER, REPO
+from .config import JOBS_DIR, OWNER, REPO
 from .db import open_db
 from .github import PR_DETAIL_QUERY, GitHub, github_token
-from .jobs import JOB_TITLES, nixpkgs_review_command, omp_command, reap_jobs
-from .util import TriageError, iso, log, pr_url, utcnow
+from .jobs import JOB_TITLES, reap_jobs
+from .settings import agent_argv, job_slots, load_settings, nixpkgs_dir, review_argv
+from .util import TriageError, iso, log, pr_url, read_tail, utcnow
 
 # Copied from the PR's target branch for the guideline check.
 GUIDELINE_FILES = (
@@ -133,7 +134,14 @@ def fetch_blobs(gh: GitHub, specs: list[str]) -> dict[str, str | None]:
     return out
 
 
-def run_check(job: sqlite3.Row) -> tuple[str, str, str | None]:
+def failure_line(jobdir: Path) -> str:
+    """The most telling line of a failed tool's output: its last `error:` line, else its last line."""
+    lines = [line.strip() for line in read_tail(jobdir / "job.log", 8192).splitlines() if line.strip()]
+    errors = [line for line in lines if line.lower().startswith("error")]
+    return (errors or lines or [""])[-1][:200]
+
+
+def run_check(job: sqlite3.Row, settings: dict[str, str]) -> tuple[str, str, str | None]:
     """Collect the PR's commits, diff, changed files and the guideline docs from the API, then run omp on them.
     Nothing comes from the local checkout: it may be shallow, and the API view is also right for merged PRs."""
     number, jobdir = job["number"], Path(job["dir"])
@@ -199,7 +207,7 @@ def run_check(job: sqlite3.Row) -> tuple[str, str, str | None]:
     with open(report, "w") as out:
         code = run_tool(
             [
-                *omp_command(),
+                *agent_argv(settings),
                 "-p",
                 "--no-session",
                 "--no-title",
@@ -214,23 +222,19 @@ def run_check(job: sqlite3.Row) -> tuple[str, str, str | None]:
         )
     text = report.read_text()
     if code != 0 or not text.strip():
-        return "failed", f"omp exited with {code}", head
+        return "failed", f"agent exited with {code}: {failure_line(jobdir)}", head
     verdicts = re.findall(r"^\W*VERDICT:\W*(PASS|ISSUES)\b", text, re.M | re.I)
     return "success", verdicts[-1].upper() if verdicts else "no verdict", head
 
 
-def run_review(job: sqlite3.Row) -> tuple[str, str, str | None]:
+def run_review(job: sqlite3.Row, settings: dict[str, str]) -> tuple[str, str, str | None]:
     number, jobdir = job["number"], Path(job["dir"])
     # nixpkgs-review puts its builddir (worktree, logs, report.md/json) under $NIXPKGS_REVIEW_CACHE_DIR.
     env = {**os.environ, "NIXPKGS_REVIEW_CACHE_DIR": str(jobdir), "GITHUB_TOKEN": github_token()}
-    code = run_tool(
-        [*nixpkgs_review_command(), "pr", str(number), "--no-shell", "--build-graph", "nix"],
-        cwd=NIXPKGS_DIR,
-        env=env,
-    )
+    code = run_tool(review_argv(settings, number), cwd=nixpkgs_dir(settings), env=env)
     reports = sorted(jobdir.glob("nixpkgs-review/pr-*/report.json"), key=lambda p: p.stat().st_mtime)
     if not reports:
-        return "failed", f"no report (nixpkgs-review exited with {code})", None
+        return "failed", f"no report (nixpkgs-review exited with {code}): {failure_line(jobdir)}", None
     data = json.loads(reports[-1].read_text())
     shutil.copyfile(reports[-1].with_name("report.md"), jobdir / "report.md")
     failed = 0
@@ -257,7 +261,7 @@ def job_slot(db: sqlite3.Connection, job: sqlite3.Row):
             "SELECT MIN(id) FROM jobs WHERE kind = ? AND status = 'pending'", (job["kind"],)
         ).fetchone()[0]
         if oldest == job["id"]:
-            for i in range(JOB_SLOTS[job["kind"]]):
+            for i in range(job_slots(load_settings(db), job["kind"])):
                 lock = open(slots / f"{job['kind']}-{i}.lock", "w")
                 try:
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -297,7 +301,9 @@ def cmd_job_run(args: argparse.Namespace) -> None:
             db.execute("UPDATE jobs SET status = 'running', started_at = ? WHERE id = ?", (iso(utcnow()), job["id"]))
             db.commit()
             log(f"running {JOB_TITLES[job['kind']]} for #{job['number']}")
-            status, summary, head = (run_check if job["kind"] == "check" else run_review)(job)
+            # Settings are read when the job starts running, so changes apply to queued jobs too.
+            settings = load_settings(db)
+            status, summary, head = (run_check if job["kind"] == "check" else run_review)(job, settings)
     except JobCancelled:
         status, summary = "cancelled", "cancelled"
     except Exception as e:
