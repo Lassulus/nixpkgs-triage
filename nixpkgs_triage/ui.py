@@ -32,7 +32,7 @@ from .jobs import (
     reap_jobs,
     start_job,
 )
-from .query import ci_label, review_marker
+from .query import MERGE_CONFLICT_LABEL, ci_label, review_marker
 from .settings import SETTINGS, load_settings, save_setting, stored_settings
 from .util import TriageError, age, open_url, pr_url, read_tail, since
 
@@ -71,8 +71,8 @@ class SyncJob:
 # (label, column, descending)
 UI_SORTS = (("oldest", "created_at", False), ("newest", "created_at", True), ("updated", "updated_at", True))
 
-# PR, age, CI, draft, mark, check, nixrev, title
-UI_PR_FORMAT = " {:<8} {:>4} {:<7} {:<5} {:<6.6} {:<7} {:<7} {}"
+# PR, age, CI, conflict, draft, mark, check, nixrev, title
+UI_PR_FORMAT = " {:<8} {:>4} {:<7} {:<8} {:<5} {:<6.6} {:<7} {:<7} {}"
 
 UI_HELP = (
     "tab/←→ pane  enter open  space details  c check  n nixpkgs-review  d drafts  o sort  R refresh  S settings  q quit"
@@ -140,8 +140,10 @@ class TriageUI:
     def load(self) -> None:
         rows = self.db.execute(
             "SELECT p.number, p.title, p.author, p.category, p.is_draft, p.created_at, p.updated_at, "
-            "p.ci_state, p.additions, p.deletions, r.status AS review_status, r.pr_updated_at AS reviewed_version "
-            "FROM prs p LEFT JOIN reviews r ON r.number = p.number WHERE p.state = 'OPEN'"
+            "p.ci_state, p.additions, p.deletions, r.status AS review_status, r.pr_updated_at AS reviewed_version, "
+            "EXISTS (SELECT 1 FROM json_each(p.labels) WHERE value = ?) AS conflict "
+            "FROM prs p LEFT JOIN reviews r ON r.number = p.number WHERE p.state = 'OPEN'",
+            (MERGE_CONFLICT_LABEL,),
         ).fetchall()
         self.all_rows = [dict(r) for r in rows]
         self.last_sync = meta_get(self.db, "last_sync")
@@ -283,7 +285,7 @@ class TriageUI:
             self.put(
                 1,
                 x,
-                UI_PR_FORMAT.format("PR", "age", "CI", "draft", "mark", "check", "nixrev", "title"),
+                UI_PR_FORMAT.format("PR", "age", "CI", "conflict", "draft", "mark", "check", "nixrev", "title"),
                 pw,
                 curses.A_BOLD | curses.A_UNDERLINE,
             )
@@ -296,6 +298,7 @@ class TriageUI:
                     f"#{r['number']}",
                     age(r["created_at"]),
                     ci_label(r["ci_state"]),
+                    "yes" if r["conflict"] else "",
                     "yes" if r["is_draft"] else "",
                     review_marker(r),
                     job_short(self.jobs.get((r["number"], "check"))),

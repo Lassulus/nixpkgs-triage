@@ -15,7 +15,8 @@ from .util import age, iso, open_url, pr_url, utcnow
 
 REVIEW_STATUSES = ("todo", "reviewing", "done", "skip")
 
-BLOCKING_LABELS = ("2.status: merge conflict", "2.status: needs-changes")
+MERGE_CONFLICT_LABEL = "2.status: merge conflict"
+BLOCKING_LABELS = (MERGE_CONFLICT_LABEL, "2.status: needs-changes")
 
 
 def add_filter_args(p: argparse.ArgumentParser) -> None:

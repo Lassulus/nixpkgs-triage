@@ -58,6 +58,8 @@ PR columns:
 - `age`: time since the PR was opened.
 - `CI`: combined GitHub check state of the latest commit: `pass`, `FAIL`, `error`, `pending`,
   or `none` if no checks reported. Rows with failing CI are red.
+- `conflict`: `yes` if the PR has the `2.status: merge conflict` label (set by the nixpkgs bot;
+  as fresh as the last sync).
 - `draft`: `yes` for draft PRs.
 - `mark`: your local status from `triage mark`. A `*` means the PR changed after you marked it.
 - `check`: latest guideline check: `pending`, `running`, `pass`, `issues`, `FAIL` (the job itself
