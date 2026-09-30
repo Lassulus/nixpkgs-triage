@@ -76,6 +76,7 @@ PR columns:
 | `d` | show or hide drafts |
 | `o` | sort: oldest created → newest created → recently updated |
 | `R` | refresh view: runs `triage update` and shows its log |
+| `S` | settings screen |
 | `q`/`esc` | quit (in the refresh view: back to the list) |
 
 You can leave the refresh view while the sync is still running; the footer shows its progress
@@ -100,36 +101,59 @@ report.
 | `↑`/`↓`, `PgUp`/`PgDn`, `g`/`G` | scroll the output |
 | `q`/`esc` | back to the list |
 
+### Settings (`S`)
+
+Lists the job settings with their values; `(default)` marks the ones you haven't changed.
+`enter` edits a value in a line editor (`enter` saves, `esc` cancels, `ctrl-u` clears), and `r`
+resets it to the default. Values are checked when you save: commands must parse and their
+program should be in PATH, and counts must be ≥ 1. A value that parses but looks wrong (program
+not found, nixpkgs checkout not a git repo) is saved with a warning.
+
 ## Background jobs
 
 ```sh
-./triage check 123456 123457     # guideline check with omp
+./triage check 123456 123457     # guideline check (agent)
 ./triage review 123456           # nixpkgs-review
 ./triage jobs [--all]            # active (or all) jobs with status
 ./triage cancel JOB_ID
 ./triage post 123456             # post the latest nixpkgs-review report as a PR comment
+./triage settings                # list settings; `settings KEY VALUE` sets, `settings KEY --reset`
 ```
 
 Each job is a detached `triage job-run ID` process. Its state lives in the `jobs` table, so jobs
 keep running after you quit the UI, and the UI picks up their state again when you restart it.
-Output goes to `jobs/<PR>/<id>-<kind>/` (`job.log`, `report.md`). At most
-`TRIAGE_MAX_CHECKS` (3) checks and `TRIAGE_MAX_REVIEWS` (1) reviews run at once; the others stay
+Output goes to `jobs/<PR>/<id>-<kind>/` (`job.log`, `report.md`). At most `max_checks` (3) checks
+and `max_reviews` (1) reviews run at once; the others stay
 `pending` and start in submission order. If a runner dies (kill, reboot), its job is marked
 failed with "runner died". Cancelling interrupts the tool with SIGINT, so nixpkgs-review removes
 its worktree.
+
+Job settings are stored in `triage.db` and edited on the settings screen or with `triage settings`.
+A job reads them when it starts running, so changes also apply to jobs that are still pending.
+
+| setting | default | used as |
+|---|---|---|
+| `agent_command` | `s omp` | the omp command for guideline checks |
+| `agent_model` | empty | `--model` for the agent; empty uses omp's default |
+| `review_command` | `nixpkgs-review` if in PATH, else `nix run nixpkgs#nixpkgs-review --` | `<command> pr N --no-shell --build-graph nix <arguments>` |
+| `review_args` | empty | extra nixpkgs-review arguments, e.g. `--systems '…'`, `--tests` |
+| `nixpkgs_dir` | `~/src/nixpkgs` | checkout nixpkgs-review runs in |
+| `max_checks` / `max_reviews` | 3 / 1 | parallel jobs per kind |
+
+If a job fails, its summary shows the tool's last `error:` line, e.g. when the agent command
+doesn't exist.
 
 - **Guideline check**: gets the PR from the GitHub API: `pr.md` (title, description, labels),
   `commits.txt` (full messages; merge commits marked), `diff.patch` (per-file summary and the
   diff as GitHub shows it), the changed files at the PR head, and the guideline docs from the
   target branch (CONTRIBUTING.md, the PR template, pkgs/nixos/lib/doc/maintainers READMEs).
   It doesn't use the local checkout, so shallow clones and merged PRs work too. That costs about
-  3–6 API requests. omp runs on these files in print mode with only read-only tools (`read`,
-  `grep`, `glob`). Its report has to cite the guideline section for every finding and ends with
-  `VERDICT: PASS|ISSUES`.
-- **nixpkgs-review**: `nixpkgs-review pr N --no-shell` in the nixpkgs checkout, with its cache
+  3–6 API requests. The agent (`agent_command`, omp flags) runs on these files in print mode with
+  only read-only tools (`read`, `grep`, `glob`). Its report has to cite the guideline section for
+  every finding and ends with `VERDICT: PASS|ISSUES`.
+- **nixpkgs-review**: `review_command pr N --no-shell` in `nixpkgs_dir`, with its cache
   directory inside the job directory. It uses GitHub's CI evaluation when possible (your token is
-  passed through). Status is `success` only if nothing failed to build. `nixpkgs-review` from
-  PATH is used if installed, otherwise `nix run nixpkgs#nixpkgs-review`.
+  passed through). Status is `success` only if nothing failed to build.
 - **Posting** posts the nixpkgs-review `report.md` as a comment, as your GitHub user, the same
   way `nixpkgs-review post-result` does.
 
@@ -153,10 +177,7 @@ its worktree.
 them. In `list`, a `*` after the status means the PR changed since you marked it.
 Review state is stored in the `reviews` table, and syncs never overwrite it.
 
-Environment: `TRIAGE_DB` and `TRIAGE_CATEGORIES` override the file locations. For jobs:
-`TRIAGE_NIXPKGS` (nixpkgs checkout, default `~/src/nixpkgs`), `TRIAGE_OMP` (omp command, default
-`omp`), `TRIAGE_NIXPKGS_REVIEW` (nixpkgs-review command), `TRIAGE_JOBS_DIR`,
-`TRIAGE_MAX_CHECKS`, `TRIAGE_MAX_REVIEWS`.
+Environment: `TRIAGE_DB`, `TRIAGE_CATEGORIES` and `TRIAGE_JOBS_DIR` override the file locations.
 
 ## Code layout
 
@@ -165,7 +186,8 @@ Environment: `TRIAGE_DB` and `TRIAGE_CATEGORIES` override the file locations. Fo
 | module | contents |
 |---|---|
 | `cli.py` | argument parsing, subcommands |
-| `config.py` | paths and environment settings |
+| `config.py` | paths |
+| `settings.py` | job settings (stored in the database) |
 | `util.py` | logging, time formatting, URLs |
 | `github.py` | rate-limit-aware GraphQL client and queries |
 | `db.py` | SQLite schema |
