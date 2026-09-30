@@ -378,8 +378,9 @@ class TriageUI:
         files = json.loads(pr["files"])
         if files and len(files[0]) < 4:
             return "files", ["", "per-file line counts are being fetched…"], False
-        width = max((len(str(f[2])) + len(str(f[3])) for f in files), default=0) + 4
-        lines = [f"{f'+{f[2]} -{f[3]}':<{width}} {f[1].lower():<9} {f[0]}" for f in files]
+        add_w = max((len(str(f[2])) for f in files), default=1)
+        del_w = max((len(str(f[3])) for f in files), default=1)
+        lines = [f"+{f[2]:>{add_w}} -{f[3]:>{del_w}}  {f[1].lower():<9} {f[0]}" for f in files]
         if pr["files_total"] > len(files):
             lines.append(f"… {pr['files_total'] - len(files)} more files (the API lists the first {len(files)})")
         title = f"files: {pr['files_total']} changed, +{pr['additions']} -{pr['deletions']} lines"
