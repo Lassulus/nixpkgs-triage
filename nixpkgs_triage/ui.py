@@ -75,8 +75,21 @@ UI_SORTS = (("oldest", "created_at", False), ("newest", "created_at", True), ("u
 UI_PR_FORMAT = " {:<8} {:>4} {:<7} {:<8} {:<5} {:<6.6} {:<7} {:<7} {}"
 
 UI_HELP = (
-    "tab/←→ pane  enter open  space details  c check  n nixpkgs-review  d drafts  o sort  R refresh  S settings  q quit"
+    "tab/←→ pane  enter open  space details  c check  n nixpkgs-review  f filters  o sort  R refresh  "
+    "S settings  q quit"
 )
+UI_FILTER_HELP = "↑↓ select  ←→/space change  r reset all  q back"
+
+# (key, label, options); the first option is the default. Filters last for the session.
+FILTERS = (
+    ("drafts", "drafts", ("hide", "show", "only")),
+    ("conflicts", "merge conflicts", ("hide", "show", "only")),
+    ("ci", "CI", ("any", "not failing", "failing")),
+    ("check", "guideline check", ("any", "not run", "pass", "issues", "failed")),
+    ("review", "nixpkgs-review", ("any", "not run", "pass", "failed")),
+)
+# Filter options -> job_short() values
+JOB_FILTER_STATES = {"pass": "pass", "issues": "issues", "failed": "FAIL"}
 UI_SETTINGS_HELP = "↑↓ select  enter edit  r reset to default  q back"
 UI_EDIT_HELP = "enter save  esc cancel  ←→ home end ctrl-u"
 
@@ -96,7 +109,8 @@ class TriageUI:
         self.cat = cat
         self.focus = "cats"
         self.view = "list"
-        self.show_drafts = False
+        self.filters = {key: options[0] for key, _, options in FILTERS}
+        self.filter_idx = 0
         self.sort_idx = 0
         self.cat_idx = 0
         self.cat_top = 0
@@ -168,11 +182,35 @@ class TriageUI:
                 SPAWNED.remove(proc)
         reap_jobs(self.db)
         self.jobs = latest_jobs(self.db)
+        if self.all_rows and (self.filters["check"] != "any" or self.filters["review"] != "any"):
+            self.apply()  # job states changed, so the job filters may match different PRs
+
+    def filter_ok(self, r: dict, key: str, value: str) -> bool:
+        if key in ("drafts", "conflicts"):
+            flag = bool(r["is_draft"] if key == "drafts" else r["conflict"])
+            return {"hide": not flag, "show": True, "only": flag}[value]
+        if key == "ci":
+            failing = r["ci_state"] in ("FAILURE", "ERROR")
+            return {"any": True, "not failing": not failing, "failing": failing}[value]
+        job = self.jobs.get((r["number"], key))
+        if value == "any":
+            return True
+        if value == "not run":
+            return job is None
+        return job is not None and job_short(job) == JOB_FILTER_STATES[value]
+
+    def filter_summary(self) -> str:
+        active = [
+            f"{label} {self.filters[key]}"
+            for key, label, options in FILTERS
+            if self.filters[key] not in ("show", "any")
+        ]
+        return ", ".join(active) or "none"
 
     def apply(self) -> None:
         """Recompute category counts and the PR list, keeping the selected PR if it is still listed."""
         keep = self.prs[self.pr_idx]["number"] if self.prs else None
-        visible = [r for r in self.all_rows if self.show_drafts or not r["is_draft"]]
+        visible = [r for r in self.all_rows if all(self.filter_ok(r, key, v) for key, v in self.filters.items())]
         self.visible_count = len(visible)
         counts = Counter(r["category"] for r in visible)
         names = self.cat.names + sorted(set(counts) - set(self.cat.names))
@@ -214,12 +252,30 @@ class TriageUI:
             self.draw_detail(h, w)
         elif self.view == "settings":
             self.draw_settings(h, w)
+        elif self.view == "filters":
+            self.draw_filters(h, w)
         else:
             self.draw_list(h, w)
         if self.confirm:
             self.put(h - 1, 0, f" {self.confirm[0]} [y/N]", w, curses.A_REVERSE | curses.A_BOLD)
         self.draw_edit(h, w)
         self.scr.refresh()
+
+    def draw_filters(self, h: int, w: int) -> None:
+        self.put(0, 0, " filters  (for the PR list and the category counts)", w, curses.A_REVERSE)
+        label_w = max(len(label) for _, label, _ in FILTERS) + 2
+        for i, (key, label, options) in enumerate(FILTERS):
+            selected = i == self.filter_idx
+            y = 2 + i
+            self.put(y, 0, f"{'▶' if selected else ' '} {label:<{label_w}}", w, curses.A_BOLD if selected else 0)
+            x = 3 + label_w
+            for option in options:
+                text = f" {option} "
+                attr = curses.A_REVERSE if option == self.filters[key] else curses.A_NORMAL
+                self.put(y, x, text, len(text), attr)
+                x += len(text) + 1
+        self.put(3 + len(FILTERS), 0, f"   {self.visible_count} of {len(self.all_rows)} open PRs match", w, self.dim)
+        self.footer(h, w, UI_FILTER_HELP)
 
     def draw_settings(self, h: int, w: int) -> None:
         self.put(0, 0, " settings  (stored in triage.db; jobs read them when they start running)", w, curses.A_REVERSE)
@@ -258,8 +314,8 @@ class TriageUI:
     def draw_list(self, h: int, w: int) -> None:
         body = h - 3  # title bar, column header, footer
         header = (
-            f" nixpkgs-triage  {self.visible_count} open  sort: {UI_SORTS[self.sort_idx][0]}  "
-            f"drafts: {'shown' if self.show_drafts else 'hidden'}  last sync: {self.last_sync or 'never'}"
+            f" nixpkgs-triage  {self.visible_count} of {len(self.all_rows)} open  sort: {UI_SORTS[self.sort_idx][0]}  "
+            f"filters: {self.filter_summary()}  last sync: {self.last_sync or 'never'}"
         )
         self.put(0, 0, header, w, curses.A_REVERSE)
 
@@ -450,6 +506,22 @@ class TriageUI:
             self.message = f"posting failed: {e}"
         self.poll_jobs(force=True)
 
+    def handle_filter_key(self, key: int) -> None:
+        fkey, _, options = FILTERS[self.filter_idx]
+        if key in (ord("q"), 27, ord("f")):
+            self.view = "list"
+        elif key in (curses.KEY_UP, ord("k")):
+            self.filter_idx = max(0, self.filter_idx - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.filter_idx = min(len(FILTERS) - 1, self.filter_idx + 1)
+        elif key in (curses.KEY_LEFT, ord("h"), curses.KEY_RIGHT, ord("l"), ord(" "), 10, 13, curses.KEY_ENTER):
+            step = -1 if key in (curses.KEY_LEFT, ord("h")) else 1
+            self.filters[fkey] = options[(options.index(self.filters[fkey]) + step) % len(options)]
+            self.apply()
+        elif key == ord("r"):
+            self.filters = {k: opts[0] for k, _, opts in FILTERS}
+            self.apply()
+
     def handle_settings_key(self, key: int) -> None:
         setting = SETTINGS[self.settings_idx]
         if key in (ord("q"), 27):
@@ -546,9 +618,8 @@ class TriageUI:
             self.start_job(selected, "check")
         elif key == ord("n") and selected:
             self.start_job(selected, "review")
-        elif key == ord("d"):
-            self.show_drafts = not self.show_drafts
-            self.apply()
+        elif key == ord("f"):
+            self.view = "filters"
         elif key == ord("o"):
             self.sort_idx = (self.sort_idx + 1) % len(UI_SORTS)
             # A new order starts at the top instead of scrolling to the previous selection.
@@ -636,6 +707,8 @@ class TriageUI:
                 self.handle_detail_key(key)
             elif self.view == "settings":
                 self.handle_settings_key(key)
+            elif self.view == "filters":
+                self.handle_filter_key(key)
             elif not self.handle_list_key(key):
                 break
         if self.sync and self.sync.running:

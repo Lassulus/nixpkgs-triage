@@ -75,7 +75,7 @@ PR columns:
 | `space`/`v` | detail view of the PR |
 | `c` | start a guideline check for the PR |
 | `n` | start nixpkgs-review for the PR |
-| `d` | show or hide drafts |
+| `f` | filter view |
 | `o` | sort: oldest created → newest created → recently updated |
 | `R` | refresh view: runs `triage update` and shows its log |
 | `S` | settings screen |
@@ -102,6 +102,20 @@ report.
 | `enter` | open the PR in the browser |
 | `↑`/`↓`, `PgUp`/`PgDn`, `g`/`G` | scroll the output |
 | `q`/`esc` | back to the list |
+
+### Filters (`f`)
+
+| filter | options (first is the default) |
+|---|---|
+| drafts | hide, show, only |
+| merge conflicts | hide, show, only |
+| CI | any, not failing, failing |
+| guideline check | any, not run, pass, issues, failed |
+| nixpkgs-review | any, not run, pass, failed |
+
+`↑`/`↓` selects a filter, and `←`/`→` or `space` changes it. Changes apply at once to the PR
+list and the category counts, and `r` resets everything to the defaults. The header shows the
+active filters and "N of M open". Filters are not saved; each UI start uses the defaults.
 
 ### Settings (`S`)
 
