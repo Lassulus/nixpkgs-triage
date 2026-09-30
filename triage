@@ -4,19 +4,23 @@
 from __future__ import annotations
 
 import argparse
+import curses
 import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 import urllib.error
 import urllib.request
 import webbrowser
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -644,7 +648,7 @@ def cmd_next(args: argparse.Namespace) -> None:
         sys.exit("nothing left in this queue")
     show(db, row["number"])
     if args.open:
-        webbrowser.open(f"https://github.com/{OWNER}/{REPO}/pull/{row['number']}")
+        open_url(pr_url(row["number"]))
 
 
 def show(db: sqlite3.Connection, number: int) -> None:
@@ -657,7 +661,7 @@ def show(db: sqlite3.Connection, number: int) -> None:
         sys.exit(f"#{number} is not in the database (run `triage update`)")
     files = json.loads(r["files"])
     print(f"#{r['number']} {r['title']}")
-    print(f"  https://github.com/{OWNER}/{REPO}/pull/{r['number']}")
+    print(f"  {pr_url(r['number'])}")
     print(f"  state:     {r['state']}{' (draft)' if r['is_draft'] else ''} -> {r['base_ref']}")
     print(f"  author:    {r['author']} ({r['author_association']})")
     print(f"  created:   {r['created_at']} ({age(r['created_at'])} ago), updated {r['updated_at']}")
@@ -680,7 +684,7 @@ def cmd_show(args: argparse.Namespace) -> None:
     load_categorizer(db)
     show(db, args.number)
     if args.open:
-        webbrowser.open(f"https://github.com/{OWNER}/{REPO}/pull/{args.number}")
+        open_url(pr_url(args.number))
 
 
 def cmd_mark(args: argparse.Namespace) -> None:
@@ -748,6 +752,316 @@ def cmd_recategorize(args: argparse.Namespace) -> None:
     log(f"recategorized {n} PRs")
 
 
+# --------------------------------------------------------------------------- curses UI
+
+
+def pr_url(number: int) -> str:
+    return f"https://github.com/{OWNER}/{REPO}/pull/{number}"
+
+
+def open_url(url: str) -> None:
+    """Open in the browser without letting the browser write into our terminal."""
+    if shutil.which("xdg-open"):
+        subprocess.Popen(
+            ["xdg-open", url],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    else:
+        webbrowser.open(url)
+
+
+class SyncJob:
+    """`triage update` in a child process; its log lines are collected for the refresh view."""
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+        self.proc = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "update"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        self.thread = threading.Thread(target=self._read, daemon=True)
+        self.thread.start()
+
+    def _read(self) -> None:
+        for line in self.proc.stdout:
+            self.lines.append(line.rstrip("\n"))
+        self.proc.wait()
+
+    @property
+    def running(self) -> bool:
+        return self.thread.is_alive()
+
+    def cancel(self) -> None:
+        # SIGINT takes the "interrupted, progress is saved" path; every page is committed.
+        if self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGINT)
+
+
+# (label, column, descending)
+UI_SORTS = (("oldest", "created_at", False), ("newest", "created_at", True), ("updated", "updated_at", True))
+
+UI_HELP = "tab/←→ pane  ↑↓ move  enter open  d drafts  o sort  R refresh  q quit"
+
+
+class TriageUI:
+    def __init__(self, scr: curses.window, db: sqlite3.Connection, cat: Categorizer):
+        self.scr = scr
+        self.db = db
+        self.cat = cat
+        self.focus = "cats"
+        self.view = "list"
+        self.show_drafts = False
+        self.sort_idx = 0
+        self.cat_idx = 0
+        self.cat_top = 0
+        self.pr_idx = 0
+        self.pr_top = 0
+        self.sync: SyncJob | None = None
+        self.sync_reloaded = True
+        self.message = ""
+        self.all_rows: list[dict] = []
+        self.categories: list[tuple[str, int]] = []
+        self.prs: list[dict] = []
+        self.visible_count = 0
+        self.last_sync = None
+
+        curses.curs_set(0)
+        scr.keypad(True)
+        scr.timeout(250)
+        self.red = self.green = self.dim = curses.A_NORMAL
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_RED, -1)
+            curses.init_pair(2, curses.COLOR_GREEN, -1)
+            self.red = curses.color_pair(1)
+            self.green = curses.color_pair(2)
+        self.dim = curses.A_DIM
+        self.load()
+
+    # data
+
+    def load(self) -> None:
+        rows = self.db.execute(
+            "SELECT p.number, p.title, p.author, p.category, p.is_draft, p.created_at, p.updated_at, "
+            "p.ci_state, p.additions, p.deletions, r.status AS review_status, r.pr_updated_at AS reviewed_version "
+            "FROM prs p LEFT JOIN reviews r ON r.number = p.number WHERE p.state = 'OPEN'"
+        ).fetchall()
+        self.all_rows = [dict(r) for r in rows]
+        self.last_sync = meta_get(self.db, "last_sync")
+        self.apply()
+
+    def apply(self) -> None:
+        """Recompute category counts and the PR list, keeping the selected PR if it is still listed."""
+        keep = self.prs[self.pr_idx]["number"] if self.prs else None
+        visible = [r for r in self.all_rows if self.show_drafts or not r["is_draft"]]
+        self.visible_count = len(visible)
+        counts = Counter(r["category"] for r in visible)
+        names = self.cat.names + sorted(set(counts) - set(self.cat.names))
+        self.categories = [("all", len(visible))] + [(n, counts.get(n, 0)) for n in names]
+        self.cat_idx = min(self.cat_idx, len(self.categories) - 1)
+        selected = self.categories[self.cat_idx][0]
+        prs = visible if selected == "all" else [r for r in visible if r["category"] == selected]
+        _, column, descending = UI_SORTS[self.sort_idx]
+        prs.sort(key=lambda r: r[column], reverse=descending)
+        self.prs = prs
+        numbers = [r["number"] for r in prs]
+        self.pr_idx = numbers.index(keep) if keep in numbers else min(self.pr_idx, max(len(prs) - 1, 0))
+
+    # drawing
+
+    def put(self, y: int, x: int, text: str, width: int, attr: int = curses.A_NORMAL) -> None:
+        if width <= 0:
+            return
+        try:
+            self.scr.addnstr(y, x, text.ljust(width), width, attr)
+        except curses.error:
+            pass  # writing the bottom-right cell always "fails"
+
+    def draw(self) -> None:
+        self.scr.erase()
+        h, w = self.scr.getmaxyx()
+        if self.view == "sync":
+            self.draw_sync(h, w)
+        else:
+            self.draw_list(h, w)
+        self.scr.refresh()
+
+    def draw_list(self, h: int, w: int) -> None:
+        body = h - 2
+        header = (
+            f" nixpkgs-triage  {self.visible_count} open  sort: {UI_SORTS[self.sort_idx][0]}  "
+            f"drafts: {'shown' if self.show_drafts else 'hidden'}  last sync: {self.last_sync or 'never'}"
+        )
+        self.put(0, 0, header, w, curses.A_REVERSE)
+
+        left_w = min(max(len(n) for n, _ in self.categories) + 9, w // 3)
+        self.cat_top = min(max(self.cat_top, self.cat_idx - body + 1), self.cat_idx)
+        for i, (name, count) in enumerate(self.categories[self.cat_top : self.cat_top + body]):
+            idx = self.cat_top + i
+            attr = curses.A_NORMAL
+            if idx == self.cat_idx:
+                attr = curses.A_REVERSE if self.focus == "cats" else curses.A_BOLD
+            elif count == 0:
+                attr = self.dim
+            self.put(1 + i, 0, f" {name:<{left_w - 9}.{left_w - 9}} {count:>6} ", left_w, attr)
+        try:
+            self.scr.vline(1, left_w, curses.ACS_VLINE, body)
+        except curses.error:
+            pass
+
+        x = left_w + 1
+        pw = w - x
+        if pw > 0:
+            self.pr_top = min(max(self.pr_top, self.pr_idx - body + 1), self.pr_idx)
+            if not self.prs:
+                self.put(1, x, " no PRs in this category", pw, self.dim)
+            for i, r in enumerate(self.prs[self.pr_top : self.pr_top + body]):
+                idx = self.pr_top + i
+                ci = CI_SHORT.get(r["ci_state"] or "", "-")
+                line = (
+                    f" #{r['number']:<7} {age(r['created_at']):>4} {ci:<4} {'D' if r['is_draft'] else ' '} "
+                    f"{review_marker(r):<6.6} {r['title']}"
+                )
+                attr = curses.A_NORMAL
+                if r["is_draft"]:
+                    attr = self.dim
+                if ci in ("FAIL", "ERR"):
+                    attr = self.red
+                if idx == self.pr_idx:
+                    attr = curses.A_REVERSE if self.focus == "prs" else curses.A_BOLD
+                self.put(1 + i, x, line, pw, attr)
+
+        footer = UI_HELP
+        if self.sync and self.sync.running:
+            last = self.sync.lines[-1] if self.sync.lines else "starting"
+            footer = f"syncing: {last}"
+        elif self.message:
+            footer = self.message
+        self.put(h - 1, 0, " " + footer, w, curses.A_REVERSE)
+
+    def draw_sync(self, h: int, w: int) -> None:
+        job = self.sync
+        if job is None:
+            state = "no sync started"
+        elif job.running:
+            state = "running"
+        else:
+            state = f"finished (exit {job.proc.returncode})"
+        self.put(0, 0, f" refresh: triage update  {state}", w, curses.A_REVERSE)
+        lines = job.lines if job else []
+        for i, line in enumerate(lines[-(h - 2):]):
+            attr = self.red if ("rror" in line or "Traceback" in line) else curses.A_NORMAL
+            if "done in" in line:
+                attr = self.green
+            self.put(1 + i, 0, line, w, attr)
+        keys = "esc/q back (sync keeps running)  c cancel" if job and job.running else "esc/q back  R run again"
+        self.put(h - 1, 0, " " + keys, w, curses.A_REVERSE)
+
+    # input
+
+    def start_sync(self) -> None:
+        if self.sync and self.sync.running:
+            return
+        self.sync = SyncJob()
+        self.sync_reloaded = False
+        self.message = ""
+
+    def move(self, delta: int) -> None:
+        h, _ = self.scr.getmaxyx()
+        if delta in ("page_up", "page_down"):
+            delta = (h - 3) * (1 if delta == "page_down" else -1)
+        if self.focus == "cats":
+            self.cat_idx = max(0, min(len(self.categories) - 1, self.cat_idx + delta))
+            self.pr_idx = self.pr_top = 0
+            self.prs = []
+            self.apply()
+        else:
+            self.pr_idx = max(0, min(len(self.prs) - 1, self.pr_idx + delta))
+
+    def handle_list_key(self, key: int) -> bool:
+        if key in (ord("q"), 27):
+            return False
+        if key in (curses.KEY_UP, ord("k")):
+            self.move(-1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.move(1)
+        elif key == curses.KEY_PPAGE:
+            self.move("page_up")
+        elif key == curses.KEY_NPAGE:
+            self.move("page_down")
+        elif key in (curses.KEY_HOME, ord("g")):
+            self.move(-10**9)
+        elif key in (curses.KEY_END, ord("G")):
+            self.move(10**9)
+        elif key in (9, curses.KEY_BTAB):
+            self.focus = "prs" if self.focus == "cats" else "cats"
+        elif key in (curses.KEY_RIGHT, ord("l")):
+            self.focus = "prs"
+        elif key in (curses.KEY_LEFT, ord("h")):
+            self.focus = "cats"
+        elif key in (10, 13, curses.KEY_ENTER):
+            if self.focus == "cats":
+                self.focus = "prs"
+            elif self.prs:
+                number = self.prs[self.pr_idx]["number"]
+                open_url(pr_url(number))
+                self.message = f"opened {pr_url(number)}"
+        elif key == ord("d"):
+            self.show_drafts = not self.show_drafts
+            self.apply()
+        elif key == ord("o"):
+            self.sort_idx = (self.sort_idx + 1) % len(UI_SORTS)
+            self.apply()
+        elif key == ord("R"):
+            self.start_sync()
+            self.view = "sync"
+        return True
+
+    def handle_sync_key(self, key: int) -> None:
+        if key in (ord("q"), 27):
+            self.view = "list"
+        elif key == ord("c") and self.sync:
+            self.sync.cancel()
+        elif key == ord("R"):
+            self.start_sync()
+
+    def run(self) -> None:
+        while True:
+            if self.sync and not self.sync.running and not self.sync_reloaded:
+                self.sync_reloaded = True
+                self.load()
+                code = self.sync.proc.returncode
+                self.message = "refresh finished" if code == 0 else f"refresh failed (exit {code}), see R"
+            self.draw()
+            key = self.scr.getch()
+            if key == -1:
+                continue
+            if key == curses.KEY_RESIZE:
+                continue
+            if self.view == "sync":
+                self.handle_sync_key(key)
+            elif not self.handle_list_key(key):
+                break
+        if self.sync and self.sync.running:
+            self.sync.cancel()
+            self.sync.thread.join(timeout=10)
+
+
+def cmd_ui(args: argparse.Namespace) -> None:
+    db = open_db()
+    cat = load_categorizer(db)
+    os.environ.setdefault("ESCDELAY", "25")
+    curses.wrapper(lambda scr: TriageUI(scr, db, cat).run())
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="triage", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -788,6 +1102,9 @@ def main() -> None:
 
     p = sub.add_parser("recategorize", help="re-apply categories.toml to all stored PRs")
     p.set_defaults(func=cmd_recategorize)
+
+    p = sub.add_parser("ui", help="interactive curses browser (categories, open in browser, refresh)")
+    p.set_defaults(func=cmd_ui)
 
     args = ap.parse_args()
     try:

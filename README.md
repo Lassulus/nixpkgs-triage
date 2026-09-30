@@ -41,6 +41,29 @@ PR's primary category, and every matching rule is kept as a tag. Topics come fro
 
 Edit the file and the next command re-categorizes the database locally, with no API calls.
 
+## Interactive UI
+
+```sh
+./triage ui
+```
+
+The left pane lists the categories with their open counts, and the right pane lists the PRs in
+the selected category. Moving through the categories filters the PR list as you go.
+
+| key | action |
+|---|---|
+| `tab`, `←`/`→`, `h`/`l` | switch pane |
+| `↑`/`↓`, `j`/`k`, `PgUp`/`PgDn`, `g`/`G` | move |
+| `enter` | on a category: jump to its PRs; on a PR: open it in the browser (`xdg-open`) |
+| `d` | show or hide drafts (drafts are marked `D`) |
+| `o` | sort: oldest created → newest created → recently updated |
+| `R` | refresh view: runs `triage update` and shows its log |
+| `q`/`esc` | quit (in the refresh view: back to the list) |
+
+You can leave the refresh view while the sync is still running; the footer shows its progress
+and the list reloads when it finishes. In the refresh view, `c` cancels the sync. Cancelling is
+safe: the sync time only advances when a sync completes, so the next refresh catches up.
+
 ## Review workflow
 
 ```sh
