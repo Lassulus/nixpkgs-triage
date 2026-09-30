@@ -30,7 +30,6 @@ from .jobs import (
     latest_jobs,
     post_review,
     reap_jobs,
-    review_report,
     start_job,
 )
 from .query import ci_label, review_marker
@@ -437,24 +436,16 @@ class TriageUI:
 
         self.confirm = (f"Cancel the {job['status']} {JOB_TITLES[kind]} for #{number}?", do)
 
-    def ask_post(self, number: int) -> None:
+    def post(self, number: int) -> None:
+        self.message = "posting…"
+        self.draw()
         try:
-            job, _ = review_report(self.db, number)
+            self.message = f"posted {post_review(self.db, number)}"
         except TriageError as e:
             self.message = str(e)
-            return
-
-        def do() -> None:
-            self.message = "posting…"
-            self.draw()
-            try:
-                self.message = f"posted {post_review(self.db, number)}"
-            except Exception as e:  # network / GitHub errors are shown, not fatal for the UI
-                self.message = f"posting failed: {e}"
-            self.poll_jobs(force=True)
-
-        again = f" (already posted {since(job['posted_at'])} ago)" if job["posted_at"] else ""
-        self.confirm = (f"Post the nixpkgs-review report as a comment on #{number} on GitHub{again}?", do)
+        except Exception as e:  # network / GitHub errors are shown, not fatal for the UI
+            self.message = f"posting failed: {e}"
+        self.poll_jobs(force=True)
 
     def handle_settings_key(self, key: int) -> None:
         setting = SETTINGS[self.settings_idx]
@@ -587,7 +578,7 @@ class TriageUI:
         elif key == ord("x"):
             self.ask_cancel(number, d["tab"])
         elif key == ord("P"):
-            self.ask_post(number)
+            self.post(number)
         elif key in (curses.KEY_UP, ord("k"), curses.KEY_DOWN, ord("j"), curses.KEY_PPAGE, curses.KEY_NPAGE):
             step = {curses.KEY_PPAGE: -d["height"], curses.KEY_NPAGE: d["height"]}.get(key, 1)
             if key in (curses.KEY_UP, ord("k")):

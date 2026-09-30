@@ -96,7 +96,7 @@ report.
 | `tab` | switch the output pane between the two jobs |
 | `l` | toggle log / report |
 | `x` | cancel the shown job (asks first) |
-| `P` | post the nixpkgs-review report as a comment on the PR (asks first; shows if already posted) |
+| `P` | post the nixpkgs-review report as a comment on the PR (no confirmation) |
 | `enter` | open the PR in the browser |
 | `↑`/`↓`, `PgUp`/`PgDn`, `g`/`G` | scroll the output |
 | `q`/`esc` | back to the list |
