@@ -19,7 +19,7 @@ import traceback
 import urllib.error
 from pathlib import Path
 
-from .config import JOBS_DIR, OWNER, REPO
+from .config import CHECK_PROMPT_PATH, JOBS_DIR, OWNER, REPO
 from .db import open_db
 from .github import PR_DETAIL_QUERY, GitHub, github_token
 from .jobs import JOB_TITLES, reap_jobs
@@ -43,53 +43,6 @@ MAX_PR_FILE_BYTES = 256 * 1024
 
 # File contents fetched per GraphQL query.
 BLOB_BATCH = 25
-
-CHECK_PROMPT = """\
-You are checking NixOS/nixpkgs pull request #{number} against the written nixpkgs contribution
-guidelines. You are not testing whether it builds or works, and you must not invent rules.
-
-Everything you need is in the current directory:
-- pr.md: title, author, target branch, labels and the PR description
-- commits.txt: every commit in the PR (hash, author, full message), oldest first
-- diff.patch: a per-file summary followed by the full diff, as GitHub shows it
-- pr-files/: the changed files as they are at the PR head (large or binary files are left out)
-- guidelines/: CONTRIBUTING.md, github/PULL_REQUEST_TEMPLATE.md, pkgs/README.md, nixos/README.md,
-  lib/README.md, doc/README.md, maintainers/README.md from the target branch (those that exist)
-
-First read the guideline sections that apply to this PR (commit message conventions are in
-CONTRIBUTING.md, package conventions in pkgs/README.md, NixOS module conventions in
-nixos/README.md). Then check the PR against them, covering at least:
-- commit messages: format, one logical change per commit, no merge commits or leftover fixups
-- PR title and description: anything the guidelines or the PR template ask for
-- new or changed packages: placement, naming, versions, meta, maintainers, fetchers and hashes,
-  update scripts, tests
-- new or changed NixOS modules: options, documentation, tests, release notes
-- anything else in the guidelines that the diff touches
-
-Only report violations of rules that are written in the guideline files, and cite the file and
-section for each one. Write "no issues found" for areas without problems. Keep it short.
-
-Reply with Markdown only, in exactly this shape:
-
-## Guideline check for #{number}
-
-### Commits
-- ...
-
-### Title and description
-- ...
-
-### Code conventions
-- ...
-
-### Summary
-One or two sentences.
-
-VERDICT: PASS
-
-The last line must be `VERDICT: PASS` if you found no guideline violations, otherwise
-`VERDICT: ISSUES`.
-"""
 
 
 class JobCancelled(Exception):
@@ -202,7 +155,8 @@ def run_check(job: sqlite3.Row, settings: dict[str, str]) -> tuple[str, str, str
             target.write_text(text)
 
     prompt = jobdir / "prompt.md"
-    prompt.write_text(CHECK_PROMPT.format(number=number))
+    # Read at run time so edits to the prompt file apply to the next check; `{number}` is the PR number.
+    prompt.write_text(CHECK_PROMPT_PATH.read_text().replace("{number}", str(number)))
     report = jobdir / "report.md"
     with open(report, "w") as out:
         code = run_tool(

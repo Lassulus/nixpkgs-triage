@@ -89,8 +89,8 @@ def job_describe(job: sqlite3.Row | None) -> str:
         text = "cancelled"
     elif job["kind"] == "check" and status == "success":
         text = {
-            "PASS": "PASS: no guideline violations found",
-            "ISSUES": "ISSUES: guideline violations found",
+            "PASS": "PASS: no blocking guideline issues",
+            "ISSUES": "ISSUES: blocking guideline issues",
         }.get(job["summary"], f"done: {job['summary']}")
     else:
         text = f"{status}: {job['summary']}"

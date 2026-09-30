@@ -62,8 +62,8 @@ PR columns:
   as fresh as the last sync).
 - `draft`: `yes` for draft PRs.
 - `mark`: your local status from `triage mark`. A `*` means the PR changed after you marked it.
-- `check`: latest guideline check: `pending`, `running`, `pass`, `issues`, `FAIL` (the job itself
-  failed) or `cancel`.
+- `check`: latest guideline check: `pending`, `running`, `pass` (no blocking issues; nits are
+  allowed), `issues` (at least one blocking issue), `FAIL` (the job itself failed) or `cancel`.
 - `nixrev`: latest nixpkgs-review: `pending`, `running`, `pass`, `FAIL` (a build failed or the
   review errored) or `cancel`.
 
@@ -165,8 +165,17 @@ doesn't exist.
   target branch (CONTRIBUTING.md, the PR template, pkgs/nixos/lib/doc/maintainers READMEs).
   It doesn't use the local checkout, so shallow clones and merged PRs work too. That costs about
   3–6 API requests. The agent (`agent_command`, omp flags) runs on these files in print mode with
-  only read-only tools (`read`, `grep`, `glob`). Its report has to cite the guideline section for
-  every finding and ends with `VERDICT: PASS|ISSUES`.
+  only read-only tools (`read`, `grep`, `glob`). Its report has two sections:
+  - **Blocking:** clear violations a reviewer would want fixed before merging, e.g. commit
+    summaries not in `attr: …` form, fixup or merge commits, a new package without meta or
+    maintainers.
+  - **Nits:** things the guidelines recommend but that routinely get merged anyway, e.g. no
+    changelog link in the commit body, unticked template boxes.
+
+  Each finding cites its guideline section. The verdict is `PASS` unless something is blocking,
+  and r-ryantm's standard nixpkgs-update format counts as accepted. The prompt is
+  `prompts/guideline-check.md` (`{number}` is the PR number); edit it to change what counts as
+  blocking. The next check uses the edited prompt.
 - **nixpkgs-review**: `review_command pr N --no-shell` in `nixpkgs_dir`, with its cache
   directory inside the job directory. Status is `success` only if nothing failed to build.
   Before a review starts, the job checks whether GitHub CI has a usable evaluation of the PR

@@ -16,3 +16,6 @@ CATEGORIES_PATH = Path(os.environ.get("TRIAGE_CATEGORIES", ROOT / "categories.to
 OWNER, REPO = "NixOS", "nixpkgs"
 
 JOBS_DIR = Path(os.environ.get("TRIAGE_JOBS_DIR", ROOT / "jobs"))
+
+# Prompt for the guideline check; edit it to change what counts as blocking.
+CHECK_PROMPT_PATH = ROOT / "prompts" / "guideline-check.md"
