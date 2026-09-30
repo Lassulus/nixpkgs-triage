@@ -56,6 +56,7 @@ the selected category. Moving through the categories filters the PR list as you 
 PR columns:
 
 - `age`: time since the PR was opened.
+- `+/-`: lines added and deleted.
 - `CI`: combined GitHub check state of the latest commit: `pass`, `FAIL`, `error`, `pending`,
   or `none` if no checks reported. Rows with failing CI are red.
 - `conflict`: `yes` if the PR has the `2.status: merge conflict` label (set by the nixpkgs bot;
@@ -90,13 +91,15 @@ safe: the sync time only advances when a sync completes, so the next refresh cat
 Shows the PR's metadata, the status of both jobs (`not run`, `pending` with queue time,
 `running` with duration, `success`/`failed` with the result summary, `cancelled`), and an output
 pane. While a job runs, the pane follows its live log; once it finishes, the pane shows the
-report.
+report. The `files` tab lists the changed files with change type and lines added and deleted per
+file. PRs synced before per-file counts were stored have their file list fetched once (1 API
+request) when you open that tab; `triage update --full` refreshes all of them.
 
 | key | action |
 |---|---|
 | `c` / `n` | start the guideline check / nixpkgs-review |
 | `tab` | switch the output pane between the two jobs |
-| `l` | toggle log / report |
+| `tab` | switch the output pane: guideline check → nixpkgs-review → files |
 | `x` | cancel the shown job (asks first) |
 | `P` | post the nixpkgs-review report as a comment on the PR (no confirmation) |
 | `enter` | open the PR in the browser |

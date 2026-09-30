@@ -22,7 +22,7 @@ fragment PR on PullRequest {
   baseRefName additions deletions changedFiles reviewDecision authorAssociation
   author { login }
   labels(first: 50) { nodes { name } }
-  files(first: 100) { totalCount nodes { path changeType } }
+  files(first: 100) { totalCount nodes { path changeType additions deletions } }
   commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
   comments { totalCount }
 }

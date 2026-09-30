@@ -190,8 +190,9 @@ def show(db: sqlite3.Connection, number: int) -> None:
     print(f"  check:     {job_describe(jobs.get((number, 'check')))}")
     print(f"  nixpkgs-review: {job_describe(jobs.get((number, 'review')))}")
     print("  files:")
-    for path, change in files[:25]:
-        print(f"    {change[0]} {path}")
+    for f in files[:25]:
+        counts = f"+{f[2]}/-{f[3]}" if len(f) > 2 else ""
+        print(f"    {f[1][0]} {counts:>12}  {f[0]}")
     if r["files_total"] > 25:
         print(f"    ... {r['files_total'] - 25} more")
 

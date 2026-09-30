@@ -43,7 +43,8 @@ def node_to_row(node: dict) -> dict:
         "ci_state": rollup["state"] if rollup else None,
         "comments": node["comments"]["totalCount"],
         "labels": [l["name"] for l in node["labels"]["nodes"]],
-        "files": [(f["path"], f["changeType"]) for f in node["files"]["nodes"]],
+        # [path, changeType, additions, deletions]; rows synced before per-file counts have only the first two.
+        "files": [(f["path"], f["changeType"], f["additions"], f["deletions"]) for f in node["files"]["nodes"]],
         "files_total": node["files"]["totalCount"],
     }
 
@@ -95,6 +96,15 @@ def paginate(gh: GitHub, variables: dict, page_size: int, after: str | None):
         yield conn, after
         if not conn["pageInfo"]["hasNextPage"]:
             return
+
+
+def refresh_pr(db: sqlite3.Connection, cat: Categorizer, number: int) -> None:
+    """Re-fetch one PR (1 request), e.g. to get per-file line counts for rows synced before they were stored."""
+    node_id = db.execute("SELECT node_id FROM prs WHERE number = ?", (number,)).fetchone()["node_id"]
+    node = GitHub(github_token(), delay=0, reserve=100).query(NODES_QUERY, {"ids": [node_id]})["nodes"][0]
+    if node:
+        upsert(db, cat, node)
+        db.commit()
 
 
 def sync_full(gh: GitHub, db: sqlite3.Connection, cat: Categorizer, page_size: int) -> None:

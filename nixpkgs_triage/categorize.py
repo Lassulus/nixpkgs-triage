@@ -54,13 +54,13 @@ class Categorizer:
             return True
         if "base" in c and c["base"].search(pr["base_ref"] or ""):
             return True
-        if "files_any" in c and any(c["files_any"].search(p) for p, _ in files):
+        if "files_any" in c and any(c["files_any"].search(f[0]) for f in files):
             return True
-        if "files_added" in c and any(t == "ADDED" and c["files_added"].search(p) for p, t in files):
+        if "files_added" in c and any(f[1] == "ADDED" and c["files_added"].search(f[0]) for f in files):
             return True
         # Only trust "all files" rules when we saw the complete file list.
         if "files_all" in c and files and len(files) >= (pr["files_total"] or 0):
-            if all(c["files_all"].search(p) for p, _ in files):
+            if all(c["files_all"].search(f[0]) for f in files):
                 return True
         return False
 

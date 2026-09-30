@@ -34,6 +34,7 @@ from .jobs import (
 )
 from .query import MERGE_CONFLICT_LABEL, ci_label, review_marker
 from .settings import SETTINGS, load_settings, save_setting, stored_settings
+from .sync import refresh_pr
 from .util import TriageError, age, open_url, pr_url, read_tail, since
 
 
@@ -71,8 +72,8 @@ class SyncJob:
 # (label, column, descending)
 UI_SORTS = (("oldest", "created_at", False), ("newest", "created_at", True), ("updated", "updated_at", True))
 
-# PR, age, CI, conflict, draft, mark, check, nixrev, title
-UI_PR_FORMAT = " {:<8} {:>4} {:<7} {:<8} {:<5} {:<6.6} {:<7} {:<7} {}"
+# PR, age, +/-, CI, conflict, draft, mark, check, nixrev, title
+UI_PR_FORMAT = " {:<8} {:>4} {:<13} {:<7} {:<8} {:<5} {:<6.6} {:<7} {:<7} {}"
 
 UI_HELP = (
     "tab/←→ pane  enter open  space details  c check  n nixpkgs-review  f filters  o sort  R refresh  "
@@ -94,8 +95,9 @@ UI_SETTINGS_HELP = "↑↓ select  enter edit  r reset to default  q back"
 UI_EDIT_HELP = "enter save  esc cancel  ←→ home end ctrl-u"
 
 UI_DETAIL_HELP = (
-    "c check  n nixpkgs-review  tab switch output  l log/report  x cancel  P post review  enter open  q back"
+    "c check  n nixpkgs-review  tab check/review/files  l log/report  x cancel  P post review  enter open  q back"
 )
+DETAIL_TABS = ("check", "review", "files")
 
 JOB_POLL_SECONDS = 2.0
 
@@ -341,7 +343,7 @@ class TriageUI:
             self.put(
                 1,
                 x,
-                UI_PR_FORMAT.format("PR", "age", "CI", "conflict", "draft", "mark", "check", "nixrev", "title"),
+                UI_PR_FORMAT.format("PR", "age", "+/-", "CI", "conflict", "draft", "mark", "check", "nixrev", "title"),
                 pw,
                 curses.A_BOLD | curses.A_UNDERLINE,
             )
@@ -353,6 +355,7 @@ class TriageUI:
                 line = UI_PR_FORMAT.format(
                     f"#{r['number']}",
                     age(r["created_at"]),
+                    f"+{r['additions']}/-{r['deletions']}",
                     ci_label(r["ci_state"]),
                     "yes" if r["conflict"] else "",
                     "yes" if r["is_draft"] else "",
@@ -370,6 +373,32 @@ class TriageUI:
                     attr = curses.A_REVERSE if self.focus == "prs" else curses.A_BOLD
                 self.put(2 + i, x, line, pw, attr)
         self.footer(h, w, UI_HELP)
+
+    def files_output(self, pr: sqlite3.Row) -> tuple[str, list[str], bool]:
+        files = json.loads(pr["files"])
+        if files and len(files[0]) < 4:
+            return "files", ["", "per-file line counts are being fetched…"], False
+        width = max((len(str(f[2])) + len(str(f[3])) for f in files), default=0) + 4
+        lines = [f"{f'+{f[2]} -{f[3]}':<{width}} {f[1].lower():<9} {f[0]}" for f in files]
+        if pr["files_total"] > len(files):
+            lines.append(f"… {pr['files_total'] - len(files)} more files (the API lists the first {len(files)})")
+        title = f"files: {pr['files_total']} changed, +{pr['additions']} -{pr['deletions']} lines"
+        return title, lines, False
+
+    def ensure_file_counts(self) -> None:
+        """PRs synced before per-file line counts were stored get them fetched once (1 API request)."""
+        pr = self.detail["pr"]
+        files = json.loads(pr["files"])
+        if not files or len(files[0]) >= 4:
+            return
+        self.message = "fetching per-file line counts…"
+        self.draw()
+        try:
+            refresh_pr(self.db, self.cat, pr["number"])
+            self.detail["pr"] = self.load_pr(pr["number"])
+            self.message = ""
+        except Exception as e:  # network / GitHub errors are shown, not fatal for the UI
+            self.message = f"fetching file stats failed: {e}"
 
     def detail_output(self, job: sqlite3.Row | None, width: int) -> tuple[str, list[str], bool]:
         """Title, lines and whether it is a log: the report once finished, otherwise the live log."""
@@ -421,9 +450,15 @@ class TriageUI:
             line = f"{'▶' if selected else ' '} [{key}] {JOB_TITLES[kind]:<22} {job_describe(job)}"
             self.put(y, 0, line, w, self.job_attr(job) | (curses.A_BOLD if selected else 0))
             y += 1
-        y += 1
+        selected = d["tab"] == "files"
+        line = f"{'▶' if selected else ' '}     {'files':<22} {pr['files_total']} changed, +{pr['additions']} -{pr['deletions']}"
+        self.put(y, 0, line, w, curses.A_BOLD if selected else curses.A_NORMAL)
+        y += 2
 
-        title, lines, is_log = self.detail_output(self.jobs.get((n, d["tab"])), w - 2)
+        if d["tab"] == "files":
+            title, lines, is_log = self.files_output(pr)
+        else:
+            title, lines, is_log = self.detail_output(self.jobs.get((n, d["tab"])), w - 2)
         self.put(y, 0, f" {title}", w, curses.A_BOLD | curses.A_UNDERLINE)
         y += 1
         height = max(1, h - 1 - y)
@@ -646,10 +681,13 @@ class TriageUI:
             self.start_job(number, kind)
             d.update(tab=kind, log=False, scroll=None)
         elif key in (9, curses.KEY_BTAB):
-            d.update(tab="review" if d["tab"] == "check" else "check", log=False, scroll=None)
-        elif key == ord("l"):
+            step = -1 if key == curses.KEY_BTAB else 1
+            d.update(tab=DETAIL_TABS[(DETAIL_TABS.index(d["tab"]) + step) % len(DETAIL_TABS)], log=False, scroll=None)
+            if d["tab"] == "files":
+                self.ensure_file_counts()
+        elif key == ord("l") and d["tab"] != "files":
             d.update(log=not d["log"], scroll=None)
-        elif key == ord("x"):
+        elif key == ord("x") and d["tab"] != "files":
             self.ask_cancel(number, d["tab"])
         elif key == ord("P"):
             self.post(number)
