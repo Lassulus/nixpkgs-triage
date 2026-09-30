@@ -98,8 +98,8 @@ request) when you open that tab; `triage update --full` refreshes all of them.
 | key | action |
 |---|---|
 | `c` / `n` | start the guideline check / nixpkgs-review |
-| `tab` | switch the output pane between the two jobs |
 | `tab` | switch the output pane: guideline check → nixpkgs-review → files |
+| `l` | toggle log / report |
 | `x` | cancel the shown job (asks first) |
 | `P` | post the nixpkgs-review report as a comment on the PR (no confirmation) |
 | `enter` | open the PR in the browser |
