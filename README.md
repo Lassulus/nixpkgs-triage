@@ -158,23 +158,41 @@ stays far below GitHub's 5000 points/hour. Only one `triage update` runs at a ti
 JSON API: `/api/status`, `/api/prs?category=&sort=&<filter>=&after=&limit=` (keyset-paged; `next`
 is the cursor for `after`), `/api/pr/N`, `/api/pr/N/check|review[?log=1]`.
 
-As a NixOS service (the token comes from the environment, since `gh` usually isn't logged in
-there):
+### NixOS module
+
+The flake exports `nixosModules.default` (and `packages.<system>.default`):
 
 ```nix
-systemd.services.nixpkgs-triage = {
-  wantedBy = [ "multi-user.target" ];
-  after = [ "network-online.target" ];
-  wants = [ "network-online.target" ];
-  path = [ pkgs.python3 pkgs.git pkgs.nix ];
-  serviceConfig = {
-    ExecStart = "/path/to/nixpkgs-triage/triage serve --listen 127.0.0.1:8080";
-    EnvironmentFile = "/run/secrets/nixpkgs-triage";  # GITHUB_TOKEN=…
-    User = "lass";
-    Restart = "on-failure";
+{
+  inputs.nixpkgs-triage.url = "git+https://…/nixpkgs-triage";  # or path:/home/lass/src/nixpkgs-triage
+
+  outputs = { nixpkgs, nixpkgs-triage, ... }: {
+    nixosConfigurations.server = nixpkgs.lib.nixosSystem {
+      modules = [
+        nixpkgs-triage.nixosModules.default
+        {
+          services.nixpkgs-triage = {
+            enable = true;
+            environmentFile = "/run/secrets/nixpkgs-triage";  # GITHUB_TOKEN=…
+          };
+        }
+      ];
+    };
   };
-};
+}
 ```
+
+| option | default | |
+|---|---|---|
+| `address` / `port` | `127.0.0.1` / `8080` | where the dashboard listens (no auth: use a reverse proxy) |
+| `openFirewall` | `false` | open `port` |
+| `syncInterval` | `300` | seconds between syncs; `0` disables the loop |
+| `environmentFile` | `null` | systemd EnvironmentFile with `GITHUB_TOKEN`; required while syncing |
+| `package` | built with the server's nixpkgs | |
+
+The service runs as a hardened `DynamicUser`, with `triage.db` and `jobs/` in
+`/var/lib/nixpkgs-triage`. Its first sync is a full one (about 40 minutes). `nix flake check`
+runs a VM test of the module.
 
 ### Push updates from GitHub
 
