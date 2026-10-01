@@ -36,6 +36,7 @@ PAGE_SIZE = 100
 DEFAULTS = {"category": "all", "sort": SORTS[0][0], **DEFAULT_FILTERS, "q": ""}
 OPTIONS = {"sort": [s[0] for s in SORTS], **{key: options for key, _, options in FILTERS}}
 COLUMNS = (
+    "",
     "PR",
     "age",
     "+/-",
@@ -63,11 +64,16 @@ nav a.sel { background: Highlight; color: HighlightText; }
 main { margin-left: 15em; padding: 0 1em; }
 form { display: flex; flex-wrap: wrap; gap: 1em; padding: .5em 0; }
 input[type=search] { width: 20em; }
-summary, .head { display: grid; gap: .6em; padding: .15em 0; white-space: nowrap;
-  grid-template-columns: 5em 2.5em 7em 4.5em 4.5em 3em 3.5em 3.5em 3.5em 8em 8em 9em 1fr;
+summary, .head { display: grid; padding: .15em 0; white-space: nowrap;
+  grid-template-columns: 1.6em 5.6em 3.1em 7.6em 5.1em 5.1em 3.6em 4.1em 4.1em 4.8em 8.6em 8.6em 11em 1fr;
   border-bottom: 1px solid color-mix(in srgb, GrayText 30%, transparent); }
-summary { cursor: pointer; list-style: none; }
-summary > * { overflow: hidden; text-overflow: ellipsis; }
+summary { list-style: none; }
+summary:hover { background: color-mix(in srgb, GrayText 12%, Canvas); }
+summary > a { display: contents; color: inherit; text-decoration: none; }
+summary > a > span, .head > span { overflow: hidden; text-overflow: ellipsis; padding-right: .6em; }
+.fold { cursor: pointer; text-align: center; color: GrayText; }
+.fold::before { content: "▸"; }
+details[open] .fold::before { content: "▾"; }
 .head { font-weight: bold; }
 .draft, .dim { color: GrayText; }
 .add, .pass { color: var(--add); }
@@ -206,6 +212,7 @@ def row_html(r: dict, jobs: Jobs) -> str:
     approvers = escape(", ".join(json.loads(r["approvals"] or "[]")))
     return (
         f'<details data-n="{n}"><summary class="{"draft" if r["is_draft"] else ""}">'
+        f'<span class="fold" title="details"></span><a href="{pr_url(n)}" target="_blank">'
         f"<span>#{n}</span><span>{age(r['created_at'])}</span>"
         f'<span><span class="add">+{r["additions"]}</span>/<span class="del">-{r["deletions"]}</span></span>'
         f'<span class="{failing}">{ci_label(r["ci_state"])}</span><span>{"yes" if r["conflict"] else ""}</span>'
@@ -213,7 +220,7 @@ def row_html(r: dict, jobs: Jobs) -> str:
         f'<span class="{check}">{check}</span><span class="{review}">{review}</span>'
         f'<span class="pass" title="{approvers}">{approvers}</span><span>{escape(r["author"] or "")}</span>'
         f'<span class="dim">{escape(r["category"])}</span><span>{escape(r["title"])}</span>'
-        f'</summary><div class="pane">loading…</div></details>'
+        f'</a></summary><div class="pane">loading…</div></details>'
     )
 
 

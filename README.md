@@ -62,7 +62,8 @@ PR comment.
 ```
 
 The curses list as one endlessly scrolling, server-rendered page, plus `approved by` (reviewers
-whose latest review approves) and `author` columns; click a PR for its details and reports. The
+whose latest review approves) and `author` columns. Clicking a row opens the PR on GitHub; `▸` folds
+out its details and reports. The
 search box filters live with fuzzy matching on number, title and author (`pyth req` finds
 `python3Packages.requests`). Filters and search live in the URL. It only reads the database (the
 sync loop is the only thing talking to GitHub), is read-only and has no authentication: put it
