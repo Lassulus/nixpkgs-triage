@@ -26,30 +26,25 @@ class Categorizer:
         cfg = tomllib.loads(raw.decode())
         self.fallback = cfg.get("fallback", "other")
         self.topic_prefix = cfg.get("topic_label_prefix", "6.topic: ")
-        self.categories = []
-        for c in cfg["category"]:
-            self.categories.append(
-                {
-                    "name": c["name"],
-                    "description": c.get("description", ""),
-                    "labels": set(c.get("labels", [])),
-                    "authors": set(c.get("authors", [])),
-                    **{key: re.compile(c[key]) for key in ("title", "base") if key in c},
-                }
-            )
+        self.categories = [
+            {
+                "name": c["name"],
+                "labels": set(c.get("labels", [])),
+                "authors": set(c.get("authors", [])),
+                **{key: re.compile(c[key]) for key in ("title", "base") if key in c},
+            }
+            for c in cfg["category"]
+        ]
         self.names = [c["name"] for c in self.categories] + [self.fallback]
 
     @staticmethod
     def _matches(c: dict, pr: dict) -> bool:
-        if c["labels"] & set(pr["labels"]):
-            return True
-        if pr["author"] in c["authors"]:
-            return True
-        if "title" in c and c["title"].search(pr["title"]):
-            return True
-        if "base" in c and c["base"].search(pr["base_ref"] or ""):
-            return True
-        return False
+        return bool(
+            c["labels"] & set(pr["labels"])
+            or pr["author"] in c["authors"]
+            or ("title" in c and c["title"].search(pr["title"]))
+            or ("base" in c and c["base"].search(pr["base_ref"] or ""))
+        )
 
     def classify(self, pr: dict) -> tuple[str, list[str], list[str]]:
         tags = [c["name"] for c in self.categories if self._matches(c, pr)]

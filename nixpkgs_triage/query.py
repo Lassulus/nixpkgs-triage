@@ -17,6 +17,10 @@ REVIEW_STATUSES = ("todo", "reviewing", "done", "skip")
 
 MERGE_CONFLICT_LABEL = "2.status: merge conflict"
 BLOCKING_LABELS = (MERGE_CONFLICT_LABEL, "2.status: needs-changes")
+READY_SQL = (
+    "COALESCE(p.ci_state, '') NOT IN ('FAILURE', 'ERROR') AND NOT EXISTS "
+    f"(SELECT 1 FROM json_each(p.labels) l WHERE l.value IN ({', '.join('?' * len(BLOCKING_LABELS))}))"
+)
 
 
 def add_filter_args(p: argparse.ArgumentParser) -> None:
@@ -47,26 +51,20 @@ def build_query(args: argparse.Namespace) -> tuple[str, list]:
     if args.category:
         where.append(f"p.category IN ({', '.join('?' for _ in args.category)})")
         params += args.category
-    for tag in args.tag or []:
-        where.append("EXISTS (SELECT 1 FROM json_each(p.tags) WHERE value = ?)")
-        params.append(tag)
-    for topic in args.topic or []:
-        where.append("EXISTS (SELECT 1 FROM json_each(p.topics) WHERE lower(value) = lower(?))")
-        params.append(topic)
-    for label in args.label or []:
-        where.append("EXISTS (SELECT 1 FROM json_each(p.labels) WHERE value = ?)")
-        params.append(label)
-    if args.author:
-        where.append("p.author = ?")
-        params.append(args.author)
-    if args.base:
-        where.append("p.base_ref = ?")
-        params.append(args.base)
+    for values, column, match in (
+        (args.tag, "tags", "value = ?"),
+        (args.topic, "topics", "lower(value) = lower(?)"),
+        (args.label, "labels", "value = ?"),
+    ):
+        for value in values or []:
+            where.append(f"EXISTS (SELECT 1 FROM json_each(p.{column}) WHERE {match})")
+            params.append(value)
+    for column, value in (("author", args.author), ("base_ref", args.base)):
+        if value:
+            where.append(f"p.{column} = ?")
+            params.append(value)
     if args.ready:
-        where.append("COALESCE(p.ci_state, '') NOT IN ('FAILURE', 'ERROR')")
-        where.append(
-            f"NOT EXISTS (SELECT 1 FROM json_each(p.labels) WHERE value IN ({', '.join('?' for _ in BLOCKING_LABELS)}))"
-        )
+        where.append(READY_SQL)
         params += BLOCKING_LABELS
     if args.max_size is not None:
         where.append("p.additions + p.deletions <= ?")
@@ -137,12 +135,7 @@ def cmd_list(args: argparse.Namespace) -> None:
     sql, params = build_query(args)
     rows = db.execute(sql + " LIMIT ?", [*params, args.limit]).fetchall()
     if args.json:
-        out = []
-        for r in rows:
-            d = dict(r)
-            for k in ("labels", "tags", "topics"):
-                d[k] = json.loads(d[k])
-            out.append(d)
+        out = [dict(r) | {k: json.loads(r[k]) for k in ("labels", "tags", "topics")} for r in rows]
         json.dump(out, sys.stdout, indent=2)
         print()
     else:
@@ -230,9 +223,7 @@ def cmd_stats(args: argparse.Namespace) -> None:
         SELECT {key_sql} AS grp,
                SUM(p.is_draft = 0) AS open,
                SUM(p.is_draft = 1) AS drafts,
-               SUM(p.is_draft = 0 AND COALESCE(p.ci_state, '') NOT IN ('FAILURE', 'ERROR')
-                   AND NOT EXISTS (SELECT 1 FROM json_each(p.labels) l
-                                   WHERE l.value IN ({", ".join("?" for _ in BLOCKING_LABELS)}))) AS ready,
+               SUM(p.is_draft = 0 AND {READY_SQL}) AS ready,
                SUM(r.status = 'done') AS done,
                SUM(r.status = 'skip') AS skipped
         FROM {source} LEFT JOIN reviews r ON r.number = p.number

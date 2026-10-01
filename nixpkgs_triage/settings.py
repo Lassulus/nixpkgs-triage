@@ -70,10 +70,8 @@ def load_settings(db: sqlite3.Connection) -> dict[str, str]:
 
 
 def validate(key: str, value: str) -> str | None:
-    """Normalize a value; raise TriageError if unusable. Returns a warning for usable but suspicious values."""
-    setting = BY_KEY.get(key)
-    if setting is None:
-        raise TriageError(f"unknown setting {key!r} (known: {', '.join(BY_KEY)})")
+    """Raise TriageError if a value is unusable; return a warning if it is usable but suspicious."""
+    setting = BY_KEY[key]
     if setting.kind in ("command", "args"):
         try:
             words = shlex.split(value)

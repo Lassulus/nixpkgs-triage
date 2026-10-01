@@ -144,10 +144,7 @@ def sync_full(gh: GitHub, db: sqlite3.Connection, cat: Categorizer, page_size: i
         run = iso(utcnow())
         meta_set(db, "full_sync_run", run)
         db.commit()
-    if cursor is None:
-        log(f"full sync started (run {run})")
-    else:
-        log(f"resuming full sync of run {run}")
+    log(f"full sync started (run {run})" if cursor is None else f"resuming full sync of run {run}")
     seen = db.execute("SELECT COUNT(*) FROM prs WHERE seen_run = ?", (run,)).fetchone()[0]
     variables = {
         "owner": OWNER,

@@ -1,22 +1,18 @@
-"""Web dashboard: a read-only JSON API and a static page over the database, plus a periodic sync."""
+"""Web dashboard: server-rendered pages from the database, plus a periodic `triage update`."""
 
 from __future__ import annotations
 
 import argparse
 import gzip
-import hashlib
 import json
 import signal
 import socket
-import sqlite3
 import threading
 import time
-from datetime import timedelta
-from http import HTTPStatus
+from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from typing import NamedTuple
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from .categorize import load_categorizer
 from .db import meta_get, open_db
@@ -30,169 +26,157 @@ from .jobs import (
     output_lines,
     reap_jobs,
 )
-from .listing import (
-    DEFAULT_FILTERS,
-    FILTERS,
-    SORTS,
-    Jobs,
-    category_counts,
-    load_open_rows,
-    sorted_rows,
-    visible_rows,
-)
+from .listing import DEFAULT_FILTERS, FILTERS, SORTS, Jobs, category_counts, load_open_rows, sorted_rows, visible_rows
 from .query import ci_label, review_marker
 from .sync import SyncJob
-from .util import TriageError, iso, log, pr_url, utcnow
-
-STATIC_DIR = Path(__file__).resolve().parent / "static"
-# URL path -> (file in STATIC_DIR, content type)
-STATIC_FILES = {
-    "/": ("index.html", "text/html; charset=utf-8"),
-    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
-    "/style.css": ("style.css", "text/css; charset=utf-8"),
-}
-
-
-def load_static() -> dict[str, tuple[bytes, bytes, str, str]]:
-    """URL path -> (body, gzipped body, content type, ETag), read once at startup."""
-    static = {}
-    for path, (name, content_type) in STATIC_FILES.items():
-        body = (STATIC_DIR / name).read_bytes()
-        static[path] = (body, gzip.compress(body, 9), content_type, f'"{hashlib.sha256(body).hexdigest()[:16]}"')
-    return static
-
+from .util import TriageError, age, log, pr_url, since
 
 PAGE_SIZE = 100
-MAX_PAGE_SIZE = 500
-# How often requests look for database changes (syncs, job runners, the curses UI all write to it).
-SNAPSHOT_CHECK_SECONDS = 2.0
+DEFAULTS = {"category": "all", "sort": SORTS[0][0], **DEFAULT_FILTERS}
+OPTIONS = {"sort": [s[0] for s in SORTS], **{key: options for key, _, options in FILTERS}}
+COLUMNS = ("PR", "age", "+/-", "CI", "conflict", "draft", "mark", "check", "nixrev", "category", "title")
 
+CSS = """
+:root { color-scheme: light dark; --add: light-dark(#2e7d32, #6cc070); --del: light-dark(#c62828, #ef6b6b); }
+body { margin: 0; font: 14px/1.4 system-ui, sans-serif; }
+header { position: sticky; top: 0; z-index: 1; display: flex; gap: 1.5em; padding: .5em 1em; background: Canvas;
+  border-bottom: 1px solid GrayText; }
+header b { margin-right: auto; }
+nav { position: fixed; top: 2.6em; bottom: 0; width: 15em; overflow-y: auto; padding: .5em 0; white-space: nowrap; }
+nav a { display: flex; justify-content: space-between; padding: 0 1em; color: inherit; text-decoration: none; }
+nav a.sel { background: Highlight; color: HighlightText; }
+main { margin-left: 15em; padding: 0 1em; }
+form { display: flex; flex-wrap: wrap; gap: 1em; padding: .5em 0; }
+summary, .head { display: grid; gap: .6em; padding: .15em 0; white-space: nowrap;
+  grid-template-columns: 5em 2.5em 7em 4.5em 4.5em 3em 3.5em 3.5em 3.5em 9em 1fr;
+  border-bottom: 1px solid color-mix(in srgb, GrayText 30%, transparent); }
+summary { cursor: pointer; list-style: none; }
+summary > * { overflow: hidden; text-overflow: ellipsis; }
+.head { font-weight: bold; }
+.draft, .dim { color: GrayText; }
+.add, .pass { color: var(--add); }
+.del, .FAIL, .issues, .failing { color: var(--del); }
+.running { color: orange; }
+.pane { padding: .5em 1em 1em; background: color-mix(in srgb, GrayText 10%, Canvas); }
+.pane p { margin: .2em 0; }
+pre { max-height: 32em; overflow: auto; padding: .5em; border: 1px solid GrayText; white-space: pre-wrap; }
+pre.log { white-space: pre; }
+"""
 
-class BadRequest(Exception):
-    pass
-
-
-class NotFound(Exception):
-    pass
+# Infinite scroll: a.more links fetch the next rows; opening a PR fetches its detail; detail links reload the pane.
+JS = """
+const load = async (pane, url) => {
+  pane.innerHTML = await (await fetch(url)).text();
+  pane.querySelectorAll("pre.log").forEach((p) => (p.scrollTop = p.scrollHeight));
+  if (pane.querySelector("[data-live]")) setTimeout(() => pane.parentNode.open && load(pane, url), 3000);
+};
+document.addEventListener("toggle", (e) => {
+  const d = e.target;
+  if (d.open && d.dataset.n && !d.dataset.loaded) load(d.lastChild, `/pr/${(d.dataset.loaded = d.dataset.n)}`);
+}, true);
+document.addEventListener("click", (e) => {
+  const a = e.target.closest(".pane a[href^='/']");
+  if (a) e.preventDefault(), load(a.closest(".pane"), a.href);
+});
+const more = new IntersectionObserver(async ([e]) => {
+  if (!e.isIntersecting) return;
+  more.unobserve(e.target);
+  e.target.outerHTML = await (await fetch(e.target.href)).text();
+  const next = document.querySelector("a.more");
+  if (next) more.observe(next);
+}, { rootMargin: "1000px" });
+const first = document.querySelector("a.more");
+if (first) more.observe(first);
+"""
 
 
 class Data(NamedTuple):
     rows: list[dict]
     jobs: Jobs
     last_sync: str | None
-    generation: int  # bumped on every reload; the page compares it to notice new data
+    generation: int
 
 
 class Snapshot:
-    """Open PRs and the latest jobs, kept in memory and reloaded when the database changed.
-
-    One connection serves all request threads (under a lock), so PRAGMA data_version tells
-    whether another connection committed since the last look."""
+    """Open PRs and latest jobs in memory, reloaded when another connection committed (PRAGMA data_version)."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.db = open_db(check_same_thread=False)
         self.category_names = load_categorizer(self.db).names
-        self.data_version: int | None = None
+        self.version = None
         self.checked = 0.0
         self.data = Data([], {}, None, 0)
 
     def current(self) -> Data:
         with self.lock:
-            if time.monotonic() - self.checked >= SNAPSHOT_CHECK_SECONDS:
+            if time.monotonic() - self.checked >= 2:
                 self.checked = time.monotonic()
                 changes = self.db.total_changes
-                reap_jobs(self.db)  # a dead runner's job shows as failed instead of running forever
+                reap_jobs(self.db)
                 version = self.db.execute("PRAGMA data_version").fetchone()[0]
-                if version != self.data_version or self.db.total_changes != changes:
-                    self.data_version = version
-                    self.data = Data(
-                        load_open_rows(self.db),
-                        latest_jobs(self.db),
-                        meta_get(self.db, "last_sync"),
-                        self.data.generation + 1,
-                    )
+                if version != self.version or self.db.total_changes != changes:
+                    self.version = version
+                    rows, jobs = load_open_rows(self.db), latest_jobs(self.db)
+                    self.data = Data(rows, jobs, meta_get(self.db, "last_sync"), self.data.generation + 1)
             return self.data
 
-    def fetchone(self, sql: str, params: tuple) -> sqlite3.Row | None:
+    def pr(self, number: int):
         with self.lock:
-            return self.db.execute(sql, params).fetchone()
+            return self.db.execute("SELECT * FROM prs WHERE number = ?", (number,)).fetchone()
 
 
-class SyncLoop:
-    """Runs `triage update` now and then every `interval` seconds after the previous run ended."""
+class SyncLoop(threading.Thread):
+    """`triage update` every `interval` seconds after the previous run ended."""
 
     def __init__(self, interval: float) -> None:
+        super().__init__(daemon=True)
         self.interval = interval
         self.job: SyncJob | None = None
-        self.last_exit: int | None = None
-        self.last_finished: str | None = None
-        self.next_at: str | None = None
-        self.thread = threading.Thread(target=self.run, daemon=True)
-        self.thread.start()
+        self.start()
 
     def run(self) -> None:
         while True:
             self.job = SyncJob(echo=True)
             self.job.thread.join()
-            self.last_exit = self.job.proc.returncode
-            finished = utcnow()
-            self.last_finished = iso(finished)
-            self.next_at = iso(finished + timedelta(seconds=self.interval))
             time.sleep(self.interval)
 
-    def state(self) -> dict:
+    def status(self) -> str:
         job = self.job
-        running = job is not None and job.running
-        return {
-            "interval": self.interval,
-            "running": running,
-            "line": job.lines[-1] if job and job.lines else None,
-            "last_exit": self.last_exit,
-            "last_finished": self.last_finished,
-            "next": None if running else self.next_at,
-        }
-
-    def stop(self) -> None:
-        if self.job and self.job.running:
-            self.job.cancel()
-            self.job.thread.join(timeout=10)
+        if job and job.running:
+            return f"syncing: {job.lines[-1] if job.lines else 'starting'}"
+        if job and job.proc.returncode:
+            return f"last sync failed (exit {job.proc.returncode})"
+        return ""
 
 
-def row_json(r: dict, jobs: Jobs) -> dict:
-    return {
-        "number": r["number"],
-        "title": r["title"],
-        "author": r["author"],
-        "category": r["category"],
-        "created_at": r["created_at"],
-        "updated_at": r["updated_at"],
-        "additions": r["additions"],
-        "deletions": r["deletions"],
-        "ci": ci_label(r["ci_state"]),
-        "ci_failing": r["ci_state"] in ("FAILURE", "ERROR"),
-        "conflict": bool(r["conflict"]),
-        "draft": bool(r["is_draft"]),
-        "mark": review_marker(r),
-        "check": job_short(jobs.get((r["number"], "check"))),
-        "review": job_short(jobs.get((r["number"], "review"))),
-    }
+def parse_state(params: dict[str, str]) -> dict:
+    state = dict(DEFAULTS)
+    for k, v in params.items():
+        if k == "category" or v in OPTIONS.get(k, ()):
+            state[k] = v
+    return state
 
 
-def job_json(job: sqlite3.Row | None) -> dict | None:
-    if job is None:
-        return None
-    return {
-        "id": job["id"],
-        "status": job["status"],
-        "short": job_short(job),
-        "describe": job_describe(job),
-        "active": job["status"] in ACTIVE_JOB_STATES,
-    }
+def query(state: dict, **change) -> str:
+    return urlencode({k: v for k, v in {**state, **change}.items() if v != DEFAULTS.get(k)})
 
 
-def sort_cursor(r: dict, column: str) -> str:
-    return f"{r[column]}|{r['number']}"
+def row_html(r: dict, jobs: Jobs) -> str:
+    n = r["number"]
+    check, review = job_short(jobs.get((n, "check"))), job_short(jobs.get((n, "review")))
+    failing = "failing" if r["ci_state"] in ("FAILURE", "ERROR") else ""
+    return (
+        f'<details data-n="{n}"><summary class="{"draft" if r["is_draft"] else ""}">'
+        f"<span>#{n}</span><span>{age(r['created_at'])}</span>"
+        f'<span><span class="add">+{r["additions"]}</span>/<span class="del">-{r["deletions"]}</span></span>'
+        f'<span class="{failing}">{ci_label(r["ci_state"])}</span><span>{"yes" if r["conflict"] else ""}</span>'
+        f"<span>{'yes' if r['is_draft'] else ''}</span><span>{escape(review_marker(r))}</span>"
+        f'<span class="{check}">{check}</span><span class="{review}">{review}</span>'
+        f'<span class="dim">{escape(r["category"])}</span>'
+        f'<span>{escape(r["title"])} <span class="dim">{escape(r["author"] or "")}</span></span>'
+        f'</summary><div class="pane">loading…</div></details>'
+    )
 
 
 class Dashboard(ThreadingHTTPServer):
@@ -204,202 +188,152 @@ class Dashboard(ThreadingHTTPServer):
         super().__init__(address, Handler)
         self.snapshot = snapshot
         self.sync = sync
-        self.static = load_static()
-        # (filters, sort) -> (visible rows, sorted rows, category counts) for the current data generation
-        self.lists: dict = {}
-        self.lists_generation = -1
+        self.lists: dict = {}  # (generation, filters, sort) -> (visible, sorted, category counts)
 
-    def sorted_list(self, data: Data, filters: dict[str, str], sort: str) -> tuple[list, list, list]:
-        """Filtered and sorted open PRs, cached until the data changes, so scrolling and category switches are cheap."""
-        if self.lists_generation != data.generation or len(self.lists) > 32:
-            self.lists, self.lists_generation = {}, data.generation
-        key = (tuple(filters.items()), sort)
+    def listing(self, state: dict) -> tuple[Data, list, list, list]:
+        data = self.snapshot.current()
+        filters = {k: state[k] for k in DEFAULT_FILTERS}
+        key = (data.generation, tuple(filters.items()), state["sort"])
         if key not in self.lists:
+            if len(self.lists) > 32:
+                self.lists.clear()
             visible = visible_rows(data.rows, data.jobs, filters)
             counts = category_counts(self.snapshot.category_names, visible)
-            self.lists[key] = (visible, sorted_rows(visible, sort), counts)
-        return self.lists[key]
+            self.lists[key] = (visible, sorted_rows(visible, state["sort"]), counts)
+        return data, *self.lists[key]
 
-    def status(self, data: Data | None = None) -> dict:
-        data = data or self.snapshot.current()
-        return {
-            "generation": data.generation,
-            "last_sync": data.last_sync,
-            "total_open": len(data.rows),
-            "sync": self.sync.state() if self.sync else None,
-        }
-
-    def prs(self, params: dict[str, str]) -> dict:
-        data = self.snapshot.current()
-        filters = {}
-        for key, _, options in FILTERS:
-            filters[key] = params.get(key, DEFAULT_FILTERS[key])
-            if filters[key] not in options:
-                raise BadRequest(f"{key} must be one of {', '.join(options)}")
-        sort = params.get("sort", SORTS[0][0])
-        if sort not in [s[0] for s in SORTS]:
-            raise BadRequest(f"unknown sort {sort}")
-        try:
-            limit = min(MAX_PAGE_SIZE, max(1, int(params.get("limit", PAGE_SIZE))))
-        except ValueError:
-            raise BadRequest("limit must be a number") from None
-        category = params.get("category", "all")
-
-        visible, prs, counts = self.sorted_list(data, filters, sort)
-        if category != "all":
-            prs = [r for r in prs if r["category"] == category]
-        _, column, descending = next(s for s in SORTS if s[0] == sort)
+    def rows(self, state: dict, after: str = "") -> str:
+        """The next PAGE_SIZE rows after the cursor (sort value|number), plus the link to the following page."""
+        data, _, prs, _ = self.listing(state)
+        if state["category"] != "all":
+            prs = [r for r in prs if r["category"] == state["category"]]
+        _, column, descending = next(s for s in SORTS if s[0] == state["sort"])
         start = 0
-        if params.get("after"):
-            # Keyset paging: continue after the last row's sort key, even if rows moved or vanished meanwhile.
-            value, _, number = params["after"].rpartition("|")
-            if not number.isdigit():
-                raise BadRequest("bad cursor")
-            cursor = (value, int(number))
-            start = next(
-                (
-                    i
-                    for i, r in enumerate(prs)
-                    if ((r[column], r["number"]) < cursor if descending else (r[column], r["number"]) > cursor)
-                ),
-                len(prs),
-            )
-        page = prs[start : start + limit]
-        more = start + limit < len(prs)
-        return {
-            **self.status(data),
-            # The page builds its controls from these, so its first load is a single API request.
-            "filters": [{"key": k, "label": label, "options": options} for k, label, options in FILTERS],
-            "sorts": [s[0] for s in SORTS],
-            "state": {"category": category, "sort": sort, "filters": filters},
-            "matching": len(visible),
-            "categories": counts,
-            "count": len(prs),
-            "prs": [row_json(r, data.jobs) for r in page],
-            "next": sort_cursor(page[-1], column) if more else None,
-        }
+        if after:
+            value, _, number = after.rpartition("|")
+            cursor = (value, int(number or 0))
 
-    def pr(self, number: int) -> dict:
-        pr = self.snapshot.fetchone(
-            "SELECT p.*, r.status AS review_status, r.note AS review_note, r.pr_updated_at AS reviewed_version "
-            "FROM prs p LEFT JOIN reviews r ON r.number = p.number WHERE p.number = ?",
-            (number,),
+            def past(r: dict) -> bool:
+                key = (r[column], r["number"])
+                return key < cursor if descending else key > cursor
+
+            start = next((i for i, r in enumerate(prs) if past(r)), len(prs))
+        page = prs[start : start + PAGE_SIZE]
+        html = "".join(row_html(r, data.jobs) for r in page)
+        if start + PAGE_SIZE < len(prs):
+            last = page[-1]
+            html += f'<a class="more" href="/rows?{query(state, after=f"{last[column]}|{last["number"]}")}">more</a>'
+        return html
+
+    def page(self, state: dict) -> str:
+        data, visible, _, counts = self.listing(state)
+        cats = "".join(
+            f'<a class="{"sel" if name == state["category"] else ""}" href="/?{query(state, category=name)}">'
+            f"{escape(name)}<span>{n}</span></a>"
+            for name, n in counts
         )
-        if pr is None:
-            raise NotFound(f"PR #{number} is not in the database")
-        jobs = self.snapshot.current().jobs
-        return {
-            "number": number,
-            "url": pr_url(number),
-            "title": pr["title"],
-            "author": pr["author"],
-            "author_association": pr["author_association"],
-            "state": pr["state"],
-            "draft": bool(pr["is_draft"]),
-            "base_ref": pr["base_ref"],
-            "created_at": pr["created_at"],
-            "updated_at": pr["updated_at"],
-            "category": pr["category"],
-            "tags": json.loads(pr["tags"]),
-            "topics": json.loads(pr["topics"]),
-            "labels": json.loads(pr["labels"]),
-            "ci": ci_label(pr["ci_state"]),
-            "comments": pr["comments"],
-            "mark": review_marker(pr),
-            "note": pr["review_note"],
-            "additions": pr["additions"],
-            "deletions": pr["deletions"],
-            "changed_files": pr["changed_files"],
-            "jobs": {kind: job_json(jobs.get((number, kind))) for kind in JOB_TITLES},
-        }
+        selects = "".join(
+            f'<label>{label} <select name="{key}" onchange="this.form.submit()">'
+            + "".join(f"<option{' selected' if o == state[key] else ''}>{o}</option>" for o in options)
+            + "</select></label>"
+            for key, label, options in (("sort", "sort", OPTIONS["sort"]), *FILTERS)
+        )
+        status = [f"{len(visible)} of {len(data.rows)} open PRs match"]
+        status.append(f"last sync {since(data.last_sync)} ago" if data.last_sync else "never synced")
+        if self.sync and self.sync.status():
+            status.append(escape(self.sync.status()))
+        return (
+            f'<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
+            f'<title>nixpkgs-triage</title><link rel="icon" href="data:,"><style>{CSS}</style>'
+            f"<header><b>nixpkgs-triage</b>{''.join(f'<span>{s}</span>' for s in status)}</header>"
+            f"<nav>{cats}</nav><main>"
+            f'<form><input type="hidden" name="category" value="{escape(state["category"])}">{selects}</form>'
+            f'<div class="head">{"".join(f"<span>{c}</span>" for c in COLUMNS)}</div>'
+            f"{self.rows(state) or '<p class=dim>no PRs match</p>'}</main><script>{JS}</script>"
+        )
 
-    def output(self, number: int, kind: str, want_log: bool) -> dict:
-        job = self.snapshot.current().jobs.get((number, kind))
+    def detail(self, number: int, tab: str, want_log: bool) -> str:
+        pr = self.snapshot.pr(number)
+        if pr is None:
+            return "<p>not in the database</p>"
+        jobs = self.snapshot.current().jobs
+
+        def joined(column: str) -> str:
+            return escape(", ".join(json.loads(pr[column]))) or "-"
+
+        lines = [
+            f'<a href="{pr_url(number)}" target="_blank">{pr_url(number)}</a>',
+            f"{pr['state'].lower()}{' draft' if pr['is_draft'] else ''} → {escape(pr['base_ref'])}, "
+            f"by {escape(pr['author'] or '')}, opened {age(pr['created_at'])} ago, "
+            f"updated {since(pr['updated_at'])} ago",
+            f"tags: {joined('tags')} · topics: {joined('topics')}",
+            f"+{pr['additions']} -{pr['deletions']} in {pr['changed_files']} files · {pr['comments']} comments",
+            f"labels: {joined('labels')}",
+        ]
+        for kind, title in JOB_TITLES.items():
+            job = jobs.get((number, kind))
+            link = f'<a href="/pr/{number}?tab={kind}">{title}</a>'
+            lines.append(f"{'<b>' + link + '</b>' if kind == tab else link}: {escape(job_describe(job))}")
+        job = jobs.get((number, tab))
         if job is None:
-            raise NotFound(f"no {JOB_TITLES[kind]} for #{number}")
+            return "".join(f"<p>{line}</p>" for line in lines)
         path, use_log = job_output(job, want_log)
-        active = job["status"] in ACTIVE_JOB_STATES
-        return {
-            "job": job_json(job),
-            "what": ("live log" if active else "log") if use_log else "report",
-            "is_log": use_log,
-            "text": "\n".join(output_lines(path)) if path.exists() else None,
-        }
+        lines.append(
+            f'<a href="/pr/{number}?tab={tab}{"" if use_log else "&log=1"}">show {"report" if use_log else "log"}</a>'
+        )
+        text = "\n".join(output_lines(path)) if path.exists() else "(no output yet)"
+        live = " data-live" if job["status"] in ACTIVE_JOB_STATES else ""
+        return (
+            "".join(f"<p>{line}</p>" for line in lines)
+            + f'<pre class="{"log" if use_log else ""}"{live}>{escape(text)}</pre>'
+        )
 
 
 class Handler(BaseHTTPRequestHandler):
     server: Dashboard
-    server_version = "nixpkgs-triage"
     protocol_version = "HTTP/1.1"  # keep-alive; every response has a Content-Length
 
     def do_GET(self) -> None:
         url = urlsplit(self.path)
         params = {k: v[-1] for k, v in parse_qs(url.query).items()}
+        state = parse_state(params)
         parts = url.path.strip("/").split("/")
-        try:
-            if url.path in self.server.static:
-                self.send_static(*self.server.static[url.path])
-            elif url.path == "/api/status":
-                self.send_json(self.server.status())
-            elif url.path == "/api/prs":
-                self.send_json(self.server.prs(params))
-            elif len(parts) == 3 and parts[:2] == ["api", "pr"] and parts[2].isdigit():
-                self.send_json(self.server.pr(int(parts[2])))
-            elif len(parts) == 4 and parts[:2] == ["api", "pr"] and parts[2].isdigit() and parts[3] in JOB_TITLES:
-                self.send_json(self.server.output(int(parts[2]), parts[3], params.get("log") == "1"))
-            else:
-                raise NotFound("not found")
-        except BadRequest as e:
-            self.send_json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
-        except NotFound as e:
-            self.send_json({"error": str(e)}, HTTPStatus.NOT_FOUND)
+        if url.path == "/":
+            self.send(200, self.server.page(state))
+        elif url.path == "/rows":
+            self.send(200, self.server.rows(state, params.get("after", "")))
+        elif len(parts) == 2 and parts[0] == "pr" and parts[1].isdigit():
+            tab = params.get("tab") if params.get("tab") in JOB_TITLES else "check"
+            self.send(200, self.server.detail(int(parts[1]), tab, params.get("log") == "1"))
+        else:
+            self.send(404, "not found")
 
-    def send_static(self, body: bytes, gzipped: bytes, content_type: str, etag: str) -> None:
-        if self.headers.get("If-None-Match") == etag:
-            self.send_response(HTTPStatus.NOT_MODIFIED)
-            self.send_header("ETag", etag)
-            self.end_headers()
-            return
-        self.send(HTTPStatus.OK, body, content_type, "no-cache", etag=etag, gzipped=gzipped)
-
-    def send_json(self, value: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
-        body = json.dumps(value, separators=(",", ":")).encode()
-        self.send(status, body, "application/json", "no-store", gzipped=gzip.compress(body, 5))
-
-    def send(
-        self, status: HTTPStatus, body: bytes, content_type: str, cache: str, etag: str = "", gzipped: bytes = b""
-    ) -> None:
-        compress = bool(gzipped) and "gzip" in self.headers.get("Accept-Encoding", "")
+    def send(self, status: int, html: str) -> None:
+        body = html.encode()
+        gzipped = "gzip" in self.headers.get("Accept-Encoding", "")
+        if gzipped:
+            body = gzip.compress(body, 5)
         self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Cache-Control", cache)
-        self.send_header("Vary", "Accept-Encoding")
-        if etag:
-            self.send_header("ETag", etag)
-        if compress:
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        if gzipped:
             self.send_header("Content-Encoding", "gzip")
-            body = gzipped
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
-        # The page polls; only failures are worth a log line.
         if isinstance(code, int) and code >= 400:
             super().log_request(code, size)
 
 
-def parse_listen(listen: str) -> tuple[str, int]:
-    host, sep, port = listen.rpartition(":")
-    if not sep or not port.isdigit():
-        raise TriageError(f"--listen must be HOST:PORT, got {listen!r}")
-    return host.strip("[]") or "0.0.0.0", int(port)
-
-
 def cmd_serve(args: argparse.Namespace) -> None:
-    address = parse_listen(args.listen)
+    host, sep, port = args.listen.rpartition(":")
+    if not sep or not port.isdigit():
+        raise TriageError(f"--listen must be HOST:PORT, got {args.listen!r}")
+    address = (host.strip("[]") or "0.0.0.0", int(port))
     snapshot = Snapshot()
-    snapshot.current()  # load the PRs now rather than in the first request
+    snapshot.current()
     sync = SyncLoop(args.sync_every) if args.sync_every > 0 else None
     server = Dashboard(address, snapshot, sync)
 
@@ -407,15 +341,13 @@ def cmd_serve(args: argparse.Namespace) -> None:
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, stop)
-    host, port = address
-    log(f"serving the dashboard on http://{f'[{host}]' if ':' in host else host}:{port}/")
-    if sync:
-        log(f"syncing every {args.sync_every:g}s")
+    log(f"serving the dashboard on http://{args.listen}/")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         log("stopping")
     finally:
         server.server_close()
-        if sync:
-            sync.stop()
+        if sync and sync.job and sync.job.running:
+            sync.job.cancel()
+            sync.job.thread.join(timeout=10)

@@ -1,4 +1,4 @@
-"""GitHub API client (GraphQL + REST GET) that stays below the primary and secondary rate limits."""
+"""GitHub API client (GraphQL + REST GET)."""
 
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ class ServerTimeout(Exception):
 
 
 class GitHub:
-    """Serial GraphQL client that stays below both the primary and secondary rate limits.
+    """Serial client that stays below GitHub's rate limits.
 
     - primary (5000 points/h): every query asks for `rateLimit`; below `reserve` we sleep until reset.
     - secondary (concurrency / CPU time): requests are strictly serial with `delay` seconds between
@@ -144,7 +144,6 @@ class GitHub:
             data = payload.get("data")
             if data is None:
                 raise RuntimeError(f"GraphQL error: {errors}")
-
             rl = data.get("rateLimit")
             if rl:
                 self.points_used += rl["cost"]
@@ -154,7 +153,7 @@ class GitHub:
             return data
 
     def get(self, path: str, accept: str = "application/vnd.github+json") -> bytes:
-        """REST GET of an API path or full API URL, e.g. get("/repos/NixOS/nixpkgs/pulls/1", "application/vnd.github.diff")."""
+        """REST GET of an API path or full API URL."""
         url = path if path.startswith("https://") else f"https://api.github.com{path}"
         return self._send(url, None, accept)[1]
 

@@ -95,8 +95,7 @@ def failure_line(jobdir: Path) -> str:
 
 
 def run_check(job: sqlite3.Row, settings: dict[str, str]) -> tuple[str, str, str | None]:
-    """Collect the PR's commits, diff, changed files and the guideline docs from the API, then run omp on them.
-    Nothing comes from the local checkout: it may be shallow, and the API view is also right for merged PRs."""
+    """Collect PR context from the API (the checkout may be shallow; this works for merged PRs), then run the agent."""
     number, jobdir = job["number"], Path(job["dir"])
     gh = GitHub(github_token(), delay=1.0, reserve=100)
     pr = gh.query(PR_DETAIL_QUERY, {"owner": OWNER, "repo": REPO, "number": number})["repository"]["pullRequest"]
@@ -155,7 +154,6 @@ def run_check(job: sqlite3.Row, settings: dict[str, str]) -> tuple[str, str, str
             target.write_text(text)
 
     prompt = jobdir / "prompt.md"
-    # Read at run time so edits to the prompt file apply to the next check; `{number}` is the PR number.
     prompt.write_text(CHECK_PROMPT_PATH.read_text().replace("{number}", str(number)))
     report = jobdir / "report.md"
     with open(report, "w") as out:
@@ -186,8 +184,7 @@ EVAL_UNAVAILABLE = ("No evaluation seems to be available on GitHub", "has expire
 
 
 def github_eval_state(gh: GitHub, number: int) -> str:
-    """Whether nixpkgs-review can use GitHub CI's evaluation of the PR head: "ready", "running" or "missing".
-    Mirrors what nixpkgs-review looks for: a non-expired `comparison` artifact of an "Eval"/"PR" workflow run."""
+    """Whether CI has the unexpired `comparison` artifact nixpkgs-review downloads: "ready", "running" or "missing"."""
     head = json.loads(gh.get(f"/repos/{OWNER}/{REPO}/pulls/{number}"))["head"]["sha"]
     runs = json.loads(gh.get(f"/repos/{OWNER}/{REPO}/actions/runs?head_sha={head}"))["workflow_runs"]
     state = "missing"
@@ -205,36 +202,40 @@ def github_eval_state(gh: GitHub, number: int) -> str:
 
 def run_review(job: sqlite3.Row, settings: dict[str, str]) -> tuple[str, str, str | None]:
     number, jobdir = job["number"], Path(job["dir"])
+    checkout, token = nixpkgs_dir(settings), github_token()
     # nixpkgs-review puts its builddir (worktree, logs, report.md/json) under $NIXPKGS_REVIEW_CACHE_DIR.
-    env = {**os.environ, "NIXPKGS_REVIEW_CACHE_DIR": str(jobdir), "GITHUB_TOKEN": github_token()}
+    env = {**os.environ, "NIXPKGS_REVIEW_CACHE_DIR": str(jobdir), "GITHUB_TOKEN": token}
     argv = review_argv(settings, number)
     local = ["--eval", "local"]
     eval_mode = "configured"  # an explicit --eval in the settings wins
     if not any(arg == "--eval" or arg.startswith("--eval=") for arg in argv):
-        state = github_eval_state(GitHub(github_token(), delay=1.0, reserve=100), number)
+        state = github_eval_state(GitHub(token, delay=1.0, reserve=100), number)
         # "missing" would make nixpkgs-review poll for 10 minutes and give up; evaluate locally right away.
         eval_mode = "local" if state == "missing" else "github"
         log(f"GitHub CI evaluation of the PR head: {state} -> {eval_mode} evaluation")
         if eval_mode == "local":
             argv += local
 
+    def latest_report() -> Path | None:
+        return max(jobdir.glob("nixpkgs-review/pr-*/report.json"), key=lambda p: p.stat().st_mtime, default=None)
+
     logfile = jobdir / "job.log"
     log_start = logfile.stat().st_size
-    code = run_tool(argv, cwd=nixpkgs_dir(settings), env=env)
-    reports = sorted(jobdir.glob("nixpkgs-review/pr-*/report.json"), key=lambda p: p.stat().st_mtime)
-    if not reports and eval_mode == "github":
+    code = run_tool(argv, cwd=checkout, env=env)
+    report = latest_report()
+    if report is None and eval_mode == "github":
         with open(logfile, "rb") as f:
             f.seek(log_start)
             output = f.read().decode(errors="replace")
         if any(marker in output for marker in EVAL_UNAVAILABLE):
             log("GitHub CI evaluation turned out to be unavailable; retrying with --eval local")
             eval_mode = "local"
-            code = run_tool(argv + local, cwd=nixpkgs_dir(settings), env=env)
-            reports = sorted(jobdir.glob("nixpkgs-review/pr-*/report.json"), key=lambda p: p.stat().st_mtime)
-    if not reports:
+            code = run_tool(argv + local, cwd=checkout, env=env)
+            report = latest_report()
+    if report is None:
         return "failed", f"no report (nixpkgs-review exited with {code}): {failure_line(jobdir)}", None
-    data = json.loads(reports[-1].read_text())
-    shutil.copyfile(reports[-1].with_name("report.md"), jobdir / "report.md")
+    data = json.loads(report.read_text())
+    shutil.copyfile(report.with_name("report.md"), jobdir / "report.md")
     failed = 0
     parts = []
     for system, result in data["result"].items():
@@ -250,8 +251,7 @@ def run_review(job: sqlite3.Row, settings: dict[str, str]) -> tuple[str, str, st
 
 @contextlib.contextmanager
 def job_slot(db: sqlite3.Connection, job: sqlite3.Row):
-    """Wait until this is the oldest pending job of its kind and a slot is free.
-    Slots are flock()ed files, so a slot frees itself when its runner dies."""
+    """Wait until this is the oldest pending job of its kind and a slot is free (flocked: dead runners free theirs)."""
     slots = JOBS_DIR / ".slots"
     slots.mkdir(parents=True, exist_ok=True)
     announced = False
@@ -288,7 +288,7 @@ def cmd_job_run(args: argparse.Namespace) -> None:
     def cancel(signum, frame):
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         signal.signal(signal.SIGINT, signal.SIG_IGN)
-        raise JobCancelled()
+        raise JobCancelled
 
     signal.signal(signal.SIGTERM, cancel)
     signal.signal(signal.SIGINT, cancel)
@@ -301,9 +301,8 @@ def cmd_job_run(args: argparse.Namespace) -> None:
             db.execute("UPDATE jobs SET status = 'running', started_at = ? WHERE id = ?", (iso(utcnow()), job["id"]))
             db.commit()
             log(f"running {JOB_TITLES[job['kind']]} for #{job['number']}")
-            # Settings are read when the job starts running, so changes apply to queued jobs too.
-            settings = load_settings(db)
-            status, summary, head = (run_check if job["kind"] == "check" else run_review)(job, settings)
+            # Read now rather than at queue time, so settings changes apply to queued jobs too.
+            status, summary, head = (run_check if job["kind"] == "check" else run_review)(job, load_settings(db))
     except JobCancelled:
         status, summary = "cancelled", "cancelled"
     except Exception as e:

@@ -67,10 +67,9 @@ def open_db(check_same_thread: bool = True) -> sqlite3.Connection:
     db.execute("PRAGMA journal_mode=WAL")
     db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)
-    # Databases from before the per-file list was dropped from the sync still have its columns.
-    for column in ("files", "files_total"):
-        if any(r["name"] == column for r in db.execute("PRAGMA table_info(prs)")):
-            db.execute(f"ALTER TABLE prs DROP COLUMN {column}")
+    # Older databases still have these dropped columns.
+    for column in {"files", "files_total"}.intersection(r["name"] for r in db.execute("PRAGMA table_info(prs)")):
+        db.execute(f"ALTER TABLE prs DROP COLUMN {column}")
     return db
 
 

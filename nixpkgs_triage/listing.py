@@ -1,4 +1,4 @@
-"""The open-PR list shared by the curses UI and the web dashboard: rows, filters, sort orders, category counts."""
+"""The open-PR list shared by the curses UI and the web dashboard."""
 
 from __future__ import annotations
 
@@ -58,14 +58,14 @@ def visible_rows(rows: list[dict], jobs: Jobs, filters: dict[str, str]) -> list[
 
 
 def category_counts(names: list[str], visible: list[dict]) -> list[tuple[str, int]]:
-    """("all", n) followed by every configured category (and unknown ones found in the rows) with its count."""
+    """("all", n), then every configured category plus unknown ones found in the rows."""
     counts = Counter(r["category"] for r in visible)
     names = names + sorted(set(counts) - set(names))
     return [("all", len(visible))] + [(n, counts.get(n, 0)) for n in names]
 
 
 def sorted_rows(rows: list[dict], sort: str) -> list[dict]:
-    """Sorted by the sort's column, PR number breaking ties (so the order is stable for paging)."""
+    """PR number breaks ties so the order is stable for paging."""
     _, column, descending = next(s for s in SORTS if s[0] == sort)
     return sorted(rows, key=lambda r: (r[column], r["number"]), reverse=descending)
 

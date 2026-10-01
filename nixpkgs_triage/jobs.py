@@ -114,9 +114,8 @@ def job_describe(job: sqlite3.Row | None) -> str:
     if job["finished_at"]:
         took = ""
         if job["started_at"]:
-            took = (
-                f", took {fmt_duration((parse_ts(job['finished_at']) - parse_ts(job['started_at'])).total_seconds())}"
-            )
+            seconds = (parse_ts(job["finished_at"]) - parse_ts(job["started_at"])).total_seconds()
+            took = f", took {fmt_duration(seconds)}"
         parts.append(f"(finished {since(job['finished_at'])} ago{took})")
     if job["head_sha"]:
         parts.append(f"at {job['head_sha'][:10]}")
@@ -126,7 +125,7 @@ def job_describe(job: sqlite3.Row | None) -> str:
 
 
 def start_job(db: sqlite3.Connection, number: int, kind: str) -> int:
-    """Record a pending job and start its detached runner (`triage job-run ID`). Returns the job id."""
+    """Record a pending job and start its detached runner (`triage job-run ID`)."""
     reap_jobs(db)
     if db.execute("SELECT 1 FROM prs WHERE number = ?", (number,)).fetchone() is None:
         raise TriageError(f"#{number} is not in the database (run `triage update`)")

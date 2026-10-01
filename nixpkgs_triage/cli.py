@@ -10,15 +10,7 @@ import nixpkgs_triage
 
 from .categorize import cmd_recategorize
 from .jobs import cmd_cancel, cmd_jobs, cmd_post, cmd_start_jobs
-from .query import (
-    REVIEW_STATUSES,
-    add_filter_args,
-    cmd_list,
-    cmd_mark,
-    cmd_next,
-    cmd_show,
-    cmd_stats,
-)
+from .query import REVIEW_STATUSES, add_filter_args, cmd_list, cmd_mark, cmd_next, cmd_show, cmd_stats
 from .runner import cmd_job_run
 from .settings import cmd_settings
 from .sync import cmd_update

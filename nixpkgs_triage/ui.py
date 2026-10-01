@@ -42,7 +42,7 @@ from .settings import SETTINGS, load_settings, save_setting, stored_settings
 from .sync import SyncJob
 from .util import TriageError, age, open_url, pr_url, since
 
-# PR, age, +/-, CI, conflict, draft, mark, check, nixrev, title
+PR_COLUMNS = ("PR", "age", "+/-", "CI", "conflict", "draft", "mark", "check", "nixrev", "title")
 UI_PR_FORMAT = " {:<8} {:>4} {:<13} {:<7} {:<8} {:<5} {:<6.6} {:<7} {:<7} {}"
 
 UI_HELP = (
@@ -50,16 +50,22 @@ UI_HELP = (
     "S settings  q quit"
 )
 UI_FILTER_HELP = "↑↓ select  ←→/space change  r reset all  q back"
-
 UI_SETTINGS_HELP = "↑↓ select  enter edit  r reset to default  q back"
 UI_EDIT_HELP = "enter save  esc cancel  ←→ home end ctrl-u"
-
 UI_DETAIL_HELP = (
     "c check  n nixpkgs-review  tab check/review  l log/report  x cancel  P post review  enter open  q back"
 )
-DETAIL_TABS = ("check", "review")
 
+JOB_KEYS = {"check": "c", "review": "n"}
 JOB_POLL_SECONDS = 2.0
+
+BACK = (ord("q"), 27)
+ENTER = (10, 13, curses.KEY_ENTER)
+UP = (curses.KEY_UP, ord("k"))
+DOWN = (curses.KEY_DOWN, ord("j"))
+HOME = (curses.KEY_HOME, ord("g"))
+END = (curses.KEY_END, ord("G"))
+PAGE = (curses.KEY_PPAGE, curses.KEY_NPAGE)
 
 
 class TriageUI:
@@ -69,7 +75,7 @@ class TriageUI:
         self.cat = cat
         self.focus = "cats"
         self.view = "list"
-        self.filters = dict(DEFAULT_FILTERS)  # filters last for the session
+        self.filters = dict(DEFAULT_FILTERS)
         self.filter_idx = 0
         self.sort_idx = 0
         self.cat_idx = 0
@@ -86,11 +92,11 @@ class TriageUI:
         self.last_sync = None
         self.jobs: dict[tuple[int, str], sqlite3.Row] = {}
         self.jobs_polled = 0.0
-        # detail view state: pr row, output tab ("check"/"review"), log instead of report, scroll (None = auto)
+        # pr, tab, log (instead of report), scroll (None = auto); draw_detail adds scroll_now, scroll_max, height
         self.detail: dict | None = None
         self.confirm: tuple[str, Callable[[], None]] | None = None
         self.settings_idx = 0
-        # settings editor: {"key", "label", "buffer", "pos"} while a value is being edited
+        # {"key", "label", "buffer", "pos"} while a setting is being edited
         self.edit: dict | None = None
 
         curses.curs_set(0)
@@ -100,16 +106,10 @@ class TriageUI:
         if curses.has_colors():
             curses.start_color()
             curses.use_default_colors()
-            curses.init_pair(1, curses.COLOR_RED, -1)
-            curses.init_pair(2, curses.COLOR_GREEN, -1)
-            curses.init_pair(3, curses.COLOR_YELLOW, -1)
-            self.red = curses.color_pair(1)
-            self.green = curses.color_pair(2)
-            self.yellow = curses.color_pair(3)
-        self.dim = curses.A_DIM
+            for pair, color in enumerate((curses.COLOR_RED, curses.COLOR_GREEN, curses.COLOR_YELLOW), 1):
+                curses.init_pair(pair, color, -1)
+            self.red, self.green, self.yellow = (curses.color_pair(pair) for pair in (1, 2, 3))
         self.load()
-
-    # data
 
     def load(self) -> None:
         self.all_rows = load_open_rows(self.db)
@@ -136,10 +136,7 @@ class TriageUI:
         reap_jobs(self.db)
         self.jobs = latest_jobs(self.db)
         if self.all_rows and (self.filters["check"] != "any" or self.filters["review"] != "any"):
-            self.apply()  # job states changed, so the job filters may match different PRs
-
-    def filter_summary(self) -> str:
-        return filter_summary(self.filters)
+            self.apply()  # job filters may now match different PRs
 
     def apply(self) -> None:
         """Recompute category counts and the PR list, keeping the selected PR if it is still listed."""
@@ -150,12 +147,9 @@ class TriageUI:
         self.cat_idx = min(self.cat_idx, len(self.categories) - 1)
         selected = self.categories[self.cat_idx][0]
         prs = visible if selected == "all" else [r for r in visible if r["category"] == selected]
-        prs = sorted_rows(prs, SORTS[self.sort_idx][0])
-        self.prs = prs
-        numbers = [r["number"] for r in prs]
-        self.pr_idx = numbers.index(keep) if keep in numbers else min(self.pr_idx, max(len(prs) - 1, 0))
-
-    # drawing
+        self.prs = sorted_rows(prs, SORTS[self.sort_idx][0])
+        numbers = [r["number"] for r in self.prs]
+        self.pr_idx = numbers.index(keep) if keep in numbers else min(self.pr_idx, max(len(self.prs) - 1, 0))
 
     def put(self, y: int, x: int, text: str, width: int, attr: int = curses.A_NORMAL) -> None:
         if width <= 0:
@@ -167,7 +161,7 @@ class TriageUI:
 
     def job_attr(self, job: sqlite3.Row | None) -> int:
         if job is None or job["status"] in ("pending", "cancelled"):
-            return self.dim
+            return curses.A_DIM
         if job["status"] == "running":
             return self.yellow
         if job["status"] == "failed" or (job["kind"] == "check" and job["summary"] != "PASS"):
@@ -177,16 +171,7 @@ class TriageUI:
     def draw(self) -> None:
         self.scr.erase()
         h, w = self.scr.getmaxyx()
-        if self.view == "sync":
-            self.draw_sync(h, w)
-        elif self.view == "detail":
-            self.draw_detail(h, w)
-        elif self.view == "settings":
-            self.draw_settings(h, w)
-        elif self.view == "filters":
-            self.draw_filters(h, w)
-        else:
-            self.draw_list(h, w)
+        getattr(self, f"draw_{self.view}")(h, w)
         if self.confirm:
             self.put(h - 1, 0, f" {self.confirm[0]} [y/N]", w, curses.A_REVERSE | curses.A_BOLD)
         self.draw_edit(h, w)
@@ -202,10 +187,10 @@ class TriageUI:
             x = 3 + label_w
             for option in options:
                 text = f" {option} "
-                attr = curses.A_REVERSE if option == self.filters[key] else curses.A_NORMAL
-                self.put(y, x, text, len(text), attr)
+                self.put(y, x, text, len(text), curses.A_REVERSE if option == self.filters[key] else curses.A_NORMAL)
                 x += len(text) + 1
-        self.put(3 + len(FILTERS), 0, f"   {self.visible_count} of {len(self.all_rows)} open PRs match", w, self.dim)
+        footer = f"   {self.visible_count} of {len(self.all_rows)} open PRs match"
+        self.put(3 + len(FILTERS), 0, footer, w, curses.A_DIM)
         self.footer(h, w, UI_FILTER_HELP)
 
     def draw_settings(self, h: int, w: int) -> None:
@@ -218,11 +203,10 @@ class TriageUI:
             selected = i == self.settings_idx
             line = f"{'▶' if selected else ' '} {s.label:<{label_w}} {value}{origin}"
             self.put(2 + i, 0, line, w, curses.A_REVERSE if selected else curses.A_NORMAL)
-        self.put(3 + len(SETTINGS), 0, f"   {SETTINGS[self.settings_idx].help}", w, self.dim)
+        self.put(3 + len(SETTINGS), 0, f"   {SETTINGS[self.settings_idx].help}", w, curses.A_DIM)
         self.footer(h, w, UI_EDIT_HELP if self.edit else UI_SETTINGS_HELP)
 
     def draw_edit(self, h: int, w: int) -> None:
-        """The one-line editor above the footer, with the terminal cursor at the edit position."""
         if not self.edit:
             curses.curs_set(0)
             return
@@ -246,7 +230,7 @@ class TriageUI:
         body = h - 3  # title bar, column header, footer
         header = (
             f" nixpkgs-triage  {self.visible_count} of {len(self.all_rows)} open  sort: {SORTS[self.sort_idx][0]}  "
-            f"filters: {self.filter_summary()}  last sync: {self.last_sync or 'never'}"
+            f"filters: {filter_summary(self.filters)}  last sync: {self.last_sync or 'never'}"
         )
         self.put(0, 0, header, w, curses.A_REVERSE)
 
@@ -254,12 +238,11 @@ class TriageUI:
         self.put(1, 0, f" {'category':<{left_w - 9}} {'PRs':>6} ", left_w, curses.A_BOLD | curses.A_UNDERLINE)
         self.cat_top = min(max(self.cat_top, self.cat_idx - body + 1), self.cat_idx)
         for i, (name, count) in enumerate(self.categories[self.cat_top : self.cat_top + body]):
-            idx = self.cat_top + i
             attr = curses.A_NORMAL
-            if idx == self.cat_idx:
+            if self.cat_top + i == self.cat_idx:
                 attr = curses.A_REVERSE if self.focus == "cats" else curses.A_BOLD
             elif count == 0:
-                attr = self.dim
+                attr = curses.A_DIM
             self.put(2 + i, 0, f" {name:<{left_w - 9}.{left_w - 9}} {count:>6} ", left_w, attr)
         try:
             self.scr.vline(1, left_w, curses.ACS_VLINE, body + 1)
@@ -269,18 +252,11 @@ class TriageUI:
         x = left_w + 1
         pw = w - x
         if pw > 0:
-            self.put(
-                1,
-                x,
-                UI_PR_FORMAT.format("PR", "age", "+/-", "CI", "conflict", "draft", "mark", "check", "nixrev", "title"),
-                pw,
-                curses.A_BOLD | curses.A_UNDERLINE,
-            )
+            self.put(1, x, UI_PR_FORMAT.format(*PR_COLUMNS), pw, curses.A_BOLD | curses.A_UNDERLINE)
             self.pr_top = min(max(self.pr_top, self.pr_idx - body + 1), self.pr_idx)
             if not self.prs:
-                self.put(2, x, " no PRs in this category", pw, self.dim)
+                self.put(2, x, " no PRs in this category", pw, curses.A_DIM)
             for i, r in enumerate(self.prs[self.pr_top : self.pr_top + body]):
-                idx = self.pr_top + i
                 line = UI_PR_FORMAT.format(
                     f"#{r['number']}",
                     age(r["created_at"]),
@@ -295,10 +271,10 @@ class TriageUI:
                 )
                 attr = curses.A_NORMAL
                 if r["is_draft"]:
-                    attr = self.dim
+                    attr = curses.A_DIM
                 if r["ci_state"] in ("FAILURE", "ERROR"):
                     attr = self.red
-                if idx == self.pr_idx:
+                if self.pr_top + i == self.pr_idx:
                     attr = curses.A_REVERSE if self.focus == "prs" else curses.A_BOLD
                 self.put(2 + i, x, line, pw, attr)
         self.footer(h, w, UI_HELP)
@@ -307,17 +283,13 @@ class TriageUI:
         """Title, lines and whether it is a log: the report once finished, otherwise the live log."""
         kind = self.detail["tab"]
         if job is None:
-            key = "c" if kind == "check" else "n"
-            return f"{JOB_TITLES[kind]}: no output", ["", f"not run yet, press {key} to start it"], False
+            return f"{JOB_TITLES[kind]}: no output", ["", f"not run yet, press {JOB_KEYS[kind]} to start it"], False
         path, use_log = job_output(job, self.detail["log"])
         if not path.exists():
             return f"{JOB_TITLES[kind]}: {path}", ["", "(no output yet)"], use_log
-        lines: list[str] = []
-        for raw in output_lines(path):
-            if use_log:
-                lines.append(raw)
-            else:
-                lines.extend(textwrap.wrap(raw, width, drop_whitespace=False) or [""])
+        lines = output_lines(path)
+        if not use_log:
+            lines = [part for raw in lines for part in textwrap.wrap(raw, width, drop_whitespace=False) or [""]]
         what = ("live log" if job["status"] in ACTIVE_JOB_STATES else "log") if use_log else "report"
         return f"{JOB_TITLES[kind]} {what}: {path}", lines, use_log
 
@@ -337,12 +309,10 @@ class TriageUI:
             f"CI: {ci_label(pr['ci_state'])}   comments: {pr['comments']}   mark: {review_marker(pr) or '-'}",
             f"labels: {', '.join(json.loads(pr['labels'])) or '-'}",
         ]
-        y = 1
-        for line in info:
+        for y, line in enumerate(info, 1):
             self.put(y, 0, " " + line, w)
-            y += 1
-        y += 1
-        for kind, key in (("check", "c"), ("review", "n")):
+        y = len(info) + 2
+        for kind, key in JOB_KEYS.items():
             job = self.jobs.get((n, kind))
             selected = d["tab"] == kind
             line = f"{'▶' if selected else ' '} [{key}] {JOB_TITLES[kind]:<22} {job_describe(job)}"
@@ -355,10 +325,8 @@ class TriageUI:
         y += 1
         height = max(1, h - 1 - y)
         max_scroll = max(0, len(lines) - height)
-        if d["scroll"] is None:  # follow logs, start reports at the top
-            scroll = max_scroll if is_log else 0
-        else:
-            scroll = min(d["scroll"], max_scroll)
+        # scroll None follows logs and starts reports at the top
+        scroll = (max_scroll if is_log else 0) if d["scroll"] is None else min(d["scroll"], max_scroll)
         d["scroll_now"], d["scroll_max"], d["height"] = scroll, max_scroll, height
         for i, line in enumerate(lines[scroll : scroll + height]):
             self.put(y + i, 0, " " + line, w)
@@ -381,8 +349,6 @@ class TriageUI:
             self.put(1 + i, 0, line, w, attr)
         keys = "esc/q back (sync keeps running)  c cancel" if job and job.running else "esc/q back  R run again"
         self.put(h - 1, 0, " " + keys, w, curses.A_REVERSE)
-
-    # actions
 
     def start_sync(self) -> None:
         if self.sync and self.sync.running:
@@ -433,15 +399,13 @@ class TriageUI:
             self.message = f"posting failed: {e}"
         self.poll_jobs(force=True)
 
-    def handle_filter_key(self, key: int) -> None:
+    def handle_filters_key(self, key: int) -> None:
         fkey, _, options = FILTERS[self.filter_idx]
-        if key in (ord("q"), 27, ord("f")):
+        if key in (*BACK, ord("f")):
             self.view = "list"
-        elif key in (curses.KEY_UP, ord("k")):
-            self.filter_idx = max(0, self.filter_idx - 1)
-        elif key in (curses.KEY_DOWN, ord("j")):
-            self.filter_idx = min(len(FILTERS) - 1, self.filter_idx + 1)
-        elif key in (curses.KEY_LEFT, ord("h"), curses.KEY_RIGHT, ord("l"), ord(" "), 10, 13, curses.KEY_ENTER):
+        elif key in UP + DOWN:
+            self.filter_idx = max(0, min(len(FILTERS) - 1, self.filter_idx + (1 if key in DOWN else -1)))
+        elif key in (curses.KEY_LEFT, ord("h"), curses.KEY_RIGHT, ord("l"), ord(" "), *ENTER):
             step = -1 if key in (curses.KEY_LEFT, ord("h")) else 1
             self.filters[fkey] = options[(options.index(self.filters[fkey]) + step) % len(options)]
             self.apply()
@@ -451,13 +415,11 @@ class TriageUI:
 
     def handle_settings_key(self, key: int) -> None:
         setting = SETTINGS[self.settings_idx]
-        if key in (ord("q"), 27):
+        if key in BACK:
             self.view = "list"
-        elif key in (curses.KEY_UP, ord("k")):
-            self.settings_idx = max(0, self.settings_idx - 1)
-        elif key in (curses.KEY_DOWN, ord("j")):
-            self.settings_idx = min(len(SETTINGS) - 1, self.settings_idx + 1)
-        elif key in (10, 13, curses.KEY_ENTER):
+        elif key in UP + DOWN:
+            self.settings_idx = max(0, min(len(SETTINGS) - 1, self.settings_idx + (1 if key in DOWN else -1)))
+        elif key in ENTER:
             value = load_settings(self.db)[setting.key]
             self.edit = {"key": setting.key, "label": setting.label, "buffer": value, "pos": len(value)}
         elif key == ord("r"):
@@ -497,43 +459,30 @@ class TriageUI:
         if self.edit:
             e["buffer"], e["pos"] = buf, pos
 
-    # input
-
-    def move(self, delta) -> None:
-        h, _ = self.scr.getmaxyx()
-        if delta in ("page_up", "page_down"):
-            delta = (h - 3) * (1 if delta == "page_down" else -1)
+    def move(self, delta: int) -> None:
         if self.focus == "cats":
             self.cat_idx = max(0, min(len(self.categories) - 1, self.cat_idx + delta))
-            self.pr_idx = self.pr_top = 0
-            self.prs = []
+            self.prs, self.pr_idx, self.pr_top = [], 0, 0
             self.apply()
         else:
             self.pr_idx = max(0, min(len(self.prs) - 1, self.pr_idx + delta))
 
-    def handle_list_key(self, key: int) -> bool:
+    def handle_list_key(self, key: int) -> None:
         selected = self.prs[self.pr_idx]["number"] if self.prs else None
-        if key in (ord("q"), 27):
-            return False
-        if key in (curses.KEY_UP, ord("k")):
-            self.move(-1)
-        elif key in (curses.KEY_DOWN, ord("j")):
-            self.move(1)
-        elif key == curses.KEY_PPAGE:
-            self.move("page_up")
-        elif key == curses.KEY_NPAGE:
-            self.move("page_down")
-        elif key in (curses.KEY_HOME, ord("g")):
-            self.move(-(10**9))
-        elif key in (curses.KEY_END, ord("G")):
-            self.move(10**9)
+        if key in UP + DOWN:
+            self.move(1 if key in DOWN else -1)
+        elif key in PAGE:
+            page = self.scr.getmaxyx()[0] - 3
+            self.move(page if key == curses.KEY_NPAGE else -page)
+        elif key in HOME + END:
+            self.move(10**9 if key in END else -(10**9))
         elif key in (9, curses.KEY_BTAB):
             self.focus = "prs" if self.focus == "cats" else "cats"
         elif key in (curses.KEY_RIGHT, ord("l")):
             self.focus = "prs"
         elif key in (curses.KEY_LEFT, ord("h")):
             self.focus = "cats"
-        elif key in (10, 13, curses.KEY_ENTER):
+        elif key in ENTER:
             if self.focus == "cats":
                 self.focus = "prs"
             elif selected:
@@ -541,31 +490,27 @@ class TriageUI:
                 self.message = f"opened {pr_url(selected)}"
         elif key in (ord(" "), ord("v")) and selected:
             self.open_detail(selected)
-        elif key == ord("c") and selected:
-            self.start_job(selected, "check")
-        elif key == ord("n") and selected:
-            self.start_job(selected, "review")
+        elif key in (ord("c"), ord("n")) and selected:
+            self.start_job(selected, "check" if key == ord("c") else "review")
         elif key == ord("f"):
             self.view = "filters"
         elif key == ord("o"):
             self.sort_idx = (self.sort_idx + 1) % len(SORTS)
-            # A new order starts at the top instead of scrolling to the previous selection.
-            self.prs, self.pr_idx, self.pr_top = [], 0, 0
+            self.prs, self.pr_idx, self.pr_top = [], 0, 0  # a new order starts at the top
             self.apply()
         elif key == ord("R"):
             self.start_sync()
             self.view = "sync"
         elif key == ord("S"):
             self.view = "settings"
-        return True
 
     def handle_detail_key(self, key: int) -> None:
         d = self.detail
         number = d["pr"]["number"]
-        if key in (ord("q"), 27):
+        if key in BACK:
             self.view = "list"
             self.detail = None
-        elif key in (10, 13, curses.KEY_ENTER):
+        elif key in ENTER:
             open_url(pr_url(number))
             self.message = f"opened {pr_url(number)}"
         elif key in (ord("c"), ord("n")):
@@ -573,28 +518,25 @@ class TriageUI:
             self.start_job(number, kind)
             d.update(tab=kind, log=False, scroll=None)
         elif key in (9, curses.KEY_BTAB):
-            step = -1 if key == curses.KEY_BTAB else 1
-            d.update(tab=DETAIL_TABS[(DETAIL_TABS.index(d["tab"]) + step) % len(DETAIL_TABS)], log=False, scroll=None)
+            d.update(tab="review" if d["tab"] == "check" else "check", log=False, scroll=None)
         elif key == ord("l"):
             d.update(log=not d["log"], scroll=None)
         elif key == ord("x"):
             self.ask_cancel(number, d["tab"])
         elif key == ord("P"):
             self.post(number)
-        elif key in (curses.KEY_UP, ord("k"), curses.KEY_DOWN, ord("j"), curses.KEY_PPAGE, curses.KEY_NPAGE):
-            step = {curses.KEY_PPAGE: -d["height"], curses.KEY_NPAGE: d["height"]}.get(key, 1)
-            if key in (curses.KEY_UP, ord("k")):
-                step = -1
+        elif key in UP + DOWN + PAGE:
+            step = {curses.KEY_PPAGE: -d["height"], curses.KEY_NPAGE: d["height"]}.get(key, 1 if key in DOWN else -1)
             scroll = min(max(0, d["scroll_now"] + step), d["scroll_max"])
             # Scrolling down to the bottom resumes following a live log.
             d["scroll"] = None if step > 0 and scroll == d["scroll_max"] else scroll
-        elif key in (curses.KEY_HOME, ord("g")):
+        elif key in HOME:
             d["scroll"] = 0
-        elif key in (curses.KEY_END, ord("G")):
+        elif key in END:
             d["scroll"] = None
 
     def handle_sync_key(self, key: int) -> None:
-        if key in (ord("q"), 27):
+        if key in BACK:
             self.view = "list"
         elif key == ord("c") and self.sync:
             self.sync.cancel()
@@ -629,16 +571,9 @@ class TriageUI:
                 if key in (ord("y"), ord("Y")):
                     action()
                 continue
-            if self.view == "sync":
-                self.handle_sync_key(key)
-            elif self.view == "detail":
-                self.handle_detail_key(key)
-            elif self.view == "settings":
-                self.handle_settings_key(key)
-            elif self.view == "filters":
-                self.handle_filter_key(key)
-            elif not self.handle_list_key(key):
+            if self.view == "list" and key in BACK:
                 break
+            getattr(self, f"handle_{self.view}_key")(key)
         if self.sync and self.sync.running:
             self.sync.cancel()
             self.sync.thread.join(timeout=10)
