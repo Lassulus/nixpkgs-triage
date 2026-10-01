@@ -69,8 +69,9 @@ summary, .head { display: grid; padding: .15em 0; white-space: nowrap;
   border-bottom: 1px solid color-mix(in srgb, GrayText 30%, transparent); }
 summary { list-style: none; }
 summary:hover { background: color-mix(in srgb, GrayText 12%, Canvas); }
-summary > a { display: contents; color: inherit; text-decoration: none; }
-summary > a > span, .head > span { overflow: hidden; text-overflow: ellipsis; padding-right: .6em; }
+summary > a { color: inherit; text-decoration: none; overflow: hidden; text-overflow: ellipsis; padding-right: .6em; }
+summary > a.author:hover { text-decoration: underline; }
+.head > span { overflow: hidden; text-overflow: ellipsis; padding-right: .6em; }
 .fold { cursor: pointer; text-align: center; color: GrayText; }
 .fold::before { content: "▸"; }
 details[open] .fold::before { content: "▾"; }
@@ -208,19 +209,33 @@ def fuzzy(q: str):
 def row_html(r: dict, jobs: Jobs) -> str:
     n = r["number"]
     check, review = job_short(jobs.get((n, "check"))), job_short(jobs.get((n, "review")))
-    failing = "failing" if r["ci_state"] in ("FAILURE", "ERROR") else ""
     approvers = escape(", ".join(json.loads(r["approvals"] or "[]")))
+    author = escape(r["author"] or "")
+    cells = [
+        ("", f"#{n}"),
+        ("", age(r["created_at"])),
+        ("", f'<span class="add">+{r["additions"]}</span>/<span class="del">-{r["deletions"]}</span>'),
+        ("failing" if r["ci_state"] in ("FAILURE", "ERROR") else "", ci_label(r["ci_state"])),
+        ("", "yes" if r["conflict"] else ""),
+        ("", "yes" if r["is_draft"] else ""),
+        ("", escape(review_marker(r))),
+        (check, check),
+        (review, review),
+        ("pass", approvers),
+        ("author", author),
+        ("dim", escape(r["category"])),
+        ("", escape(r["title"])),
+    ]
+    # Every cell links to the PR, except the author's, which links to their profile.
+    profile = f"https://github.com/apps/{author[:-5]}" if author.endswith("[bot]") else f"https://github.com/{author}"
+    pr, profile = pr_url(n), profile if author else pr_url(n)
+    links = "".join(
+        f'<a class="{cls}" href="{profile if cls == "author" else pr}" target="_blank">{text}</a>'
+        for cls, text in cells
+    )
     return (
         f'<details data-n="{n}"><summary class="{"draft" if r["is_draft"] else ""}">'
-        f'<span class="fold" title="details"></span><a href="{pr_url(n)}" target="_blank">'
-        f"<span>#{n}</span><span>{age(r['created_at'])}</span>"
-        f'<span><span class="add">+{r["additions"]}</span>/<span class="del">-{r["deletions"]}</span></span>'
-        f'<span class="{failing}">{ci_label(r["ci_state"])}</span><span>{"yes" if r["conflict"] else ""}</span>'
-        f"<span>{'yes' if r['is_draft'] else ''}</span><span>{escape(review_marker(r))}</span>"
-        f'<span class="{check}">{check}</span><span class="{review}">{review}</span>'
-        f'<span class="pass" title="{approvers}">{approvers}</span><span>{escape(r["author"] or "")}</span>'
-        f'<span class="dim">{escape(r["category"])}</span><span>{escape(r["title"])}</span>'
-        f'</a></summary><div class="pane">loading…</div></details>'
+        f'<span class="fold" title="details"></span>{links}</summary><div class="pane">loading…</div></details>'
     )
 
 

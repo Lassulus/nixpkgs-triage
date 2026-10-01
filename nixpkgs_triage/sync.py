@@ -62,6 +62,13 @@ class SyncJob:
             self.proc.send_signal(signal.SIGINT)
 
 
+def author_login(author: dict | None) -> str | None:
+    """Bots are written like GitHub does (`name[bot]`); their page is github.com/apps/name, not github.com/name."""
+    if author is None:
+        return None
+    return author["login"] + ("[bot]" if author.get("__typename") == "Bot" else "")
+
+
 def node_to_row(node: dict) -> dict:
     commits = node["commits"]["nodes"]
     rollup = commits[0]["commit"]["statusCheckRollup"] if commits else None
@@ -69,7 +76,7 @@ def node_to_row(node: dict) -> dict:
         "number": node["number"],
         "node_id": node["id"],
         "title": node["title"],
-        "author": (node.get("author") or {}).get("login"),
+        "author": author_login(node.get("author")),
         "author_association": node["authorAssociation"],
         "state": node["state"],
         "is_draft": int(node["isDraft"]),

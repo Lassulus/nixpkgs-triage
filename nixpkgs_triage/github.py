@@ -20,7 +20,7 @@ PR_FRAGMENT = """
 fragment PR on PullRequest {
   id number title state isDraft createdAt updatedAt closedAt mergedAt
   baseRefName additions deletions changedFiles reviewDecision authorAssociation
-  author { login }
+  author { login __typename }
   labels(first: 50) { nodes { name } }
   commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
   comments { totalCount }
