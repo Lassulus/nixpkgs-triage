@@ -39,7 +39,7 @@ from .listing import (
 )
 from .query import ci_label, review_marker
 from .settings import SETTINGS, load_settings, save_setting, stored_settings
-from .sync import SyncJob, refresh_pr
+from .sync import SyncJob
 from .util import TriageError, age, open_url, pr_url, since
 
 # PR, age, +/-, CI, conflict, draft, mark, check, nixrev, title
@@ -55,9 +55,9 @@ UI_SETTINGS_HELP = "↑↓ select  enter edit  r reset to default  q back"
 UI_EDIT_HELP = "enter save  esc cancel  ←→ home end ctrl-u"
 
 UI_DETAIL_HELP = (
-    "c check  n nixpkgs-review  tab check/review/files  l log/report  x cancel  P post review  enter open  q back"
+    "c check  n nixpkgs-review  tab check/review  l log/report  x cancel  P post review  enter open  q back"
 )
-DETAIL_TABS = ("check", "review", "files")
+DETAIL_TABS = ("check", "review")
 
 JOB_POLL_SECONDS = 2.0
 
@@ -303,33 +303,6 @@ class TriageUI:
                 self.put(2 + i, x, line, pw, attr)
         self.footer(h, w, UI_HELP)
 
-    def files_output(self, pr: sqlite3.Row) -> tuple[str, list[str], bool]:
-        files = json.loads(pr["files"])
-        if files and len(files[0]) < 4:
-            return "files", ["", "per-file line counts are being fetched…"], False
-        add_w = max((len(str(f[2])) for f in files), default=1)
-        del_w = max((len(str(f[3])) for f in files), default=1)
-        lines = [f"+{f[2]:>{add_w}} -{f[3]:>{del_w}}  {f[1].lower():<9} {f[0]}" for f in files]
-        if pr["files_total"] > len(files):
-            lines.append(f"… {pr['files_total'] - len(files)} more files (the API lists the first {len(files)})")
-        title = f"files: {pr['files_total']} changed, +{pr['additions']} -{pr['deletions']} lines"
-        return title, lines, False
-
-    def ensure_file_counts(self) -> None:
-        """PRs synced before per-file line counts were stored get them fetched once (1 API request)."""
-        pr = self.detail["pr"]
-        files = json.loads(pr["files"])
-        if not files or len(files[0]) >= 4:
-            return
-        self.message = "fetching per-file line counts…"
-        self.draw()
-        try:
-            refresh_pr(self.db, self.cat, pr["number"])
-            self.detail["pr"] = self.load_pr(pr["number"])
-            self.message = ""
-        except Exception as e:  # network / GitHub errors are shown, not fatal for the UI
-            self.message = f"fetching file stats failed: {e}"
-
     def detail_output(self, job: sqlite3.Row | None, width: int) -> tuple[str, list[str], bool]:
         """Title, lines and whether it is a log: the report once finished, otherwise the live log."""
         kind = self.detail["tab"]
@@ -360,7 +333,7 @@ class TriageUI:
             f"opened {age(pr['created_at'])} ago, updated {since(pr['updated_at'])} ago",
             f"category: {pr['category']}   tags: {', '.join(json.loads(pr['tags'])) or '-'}   "
             f"topics: {', '.join(json.loads(pr['topics'])) or '-'}",
-            f"size: +{pr['additions']}/-{pr['deletions']} in {pr['files_total']} files   "
+            f"size: +{pr['additions']}/-{pr['deletions']} in {pr['changed_files']} files   "
             f"CI: {ci_label(pr['ci_state'])}   comments: {pr['comments']}   mark: {review_marker(pr) or '-'}",
             f"labels: {', '.join(json.loads(pr['labels'])) or '-'}",
         ]
@@ -375,15 +348,9 @@ class TriageUI:
             line = f"{'▶' if selected else ' '} [{key}] {JOB_TITLES[kind]:<22} {job_describe(job)}"
             self.put(y, 0, line, w, self.job_attr(job) | (curses.A_BOLD if selected else 0))
             y += 1
-        selected = d["tab"] == "files"
-        line = f"{'▶' if selected else ' '}     {'files':<22} {pr['files_total']} changed, +{pr['additions']} -{pr['deletions']}"
-        self.put(y, 0, line, w, curses.A_BOLD if selected else curses.A_NORMAL)
-        y += 2
+        y += 1
 
-        if d["tab"] == "files":
-            title, lines, is_log = self.files_output(pr)
-        else:
-            title, lines, is_log = self.detail_output(self.jobs.get((n, d["tab"])), w - 2)
+        title, lines, is_log = self.detail_output(self.jobs.get((n, d["tab"])), w - 2)
         self.put(y, 0, f" {title}", w, curses.A_BOLD | curses.A_UNDERLINE)
         y += 1
         height = max(1, h - 1 - y)
@@ -434,17 +401,10 @@ class TriageUI:
 
     def open_detail(self, number: int) -> None:
         jobs = latest_jobs(self.db, number)
-        # Start on the output that exists: the check, else the review, else the changed files.
-        if (number, "check") in jobs:
-            tab = "check"
-        elif (number, "review") in jobs:
-            tab = "review"
-        else:
-            tab = "files"
+        # Show the review output if that is the only thing that ran.
+        tab = "review" if (number, "review") in jobs and (number, "check") not in jobs else "check"
         self.detail = {"pr": self.load_pr(number), "tab": tab, "log": False, "scroll": None}
         self.view = "detail"
-        if tab == "files":
-            self.ensure_file_counts()
 
     def ask_cancel(self, number: int, kind: str) -> None:
         job = self.jobs.get((number, kind))
@@ -615,11 +575,9 @@ class TriageUI:
         elif key in (9, curses.KEY_BTAB):
             step = -1 if key == curses.KEY_BTAB else 1
             d.update(tab=DETAIL_TABS[(DETAIL_TABS.index(d["tab"]) + step) % len(DETAIL_TABS)], log=False, scroll=None)
-            if d["tab"] == "files":
-                self.ensure_file_counts()
-        elif key == ord("l") and d["tab"] != "files":
+        elif key == ord("l"):
             d.update(log=not d["log"], scroll=None)
-        elif key == ord("x") and d["tab"] != "files":
+        elif key == ord("x"):
             self.ask_cancel(number, d["tab"])
         elif key == ord("P"):
             self.post(number)

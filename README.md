@@ -18,9 +18,9 @@ Guideline checks need `omp`; nixpkgs-review needs `nix` and a nixpkgs git checko
 
 How it stays under GitHub's rate limits:
 
-- **One GraphQL query per page** returns labels, up to 100 changed files, CI rollup and metadata
-  for 50 PRs. That costs 1–2 points, so a full sync of ~12k PRs uses a few hundred of the
-  5000 points/hour.
+- **One GraphQL query per page** returns labels, CI rollup and metadata (including line and file
+  counts, but not the file list) for 50 PRs. That costs 1 point and about 5s of GitHub's time,
+  so a full sync of ~12k PRs takes about half an hour and a few hundred of the 5000 points/hour.
 - **Incremental sync** walks PRs of any state newest-updated first and stops at the previous
   watermark (minus a 5-minute overlap). Merged and closed PRs drop out of the open set this way.
 - **Primary limit**: each response includes `rateLimit`. When fewer than `--reserve` (500) points
@@ -37,8 +37,8 @@ How it stays under GitHub's rate limits:
 
 `categories.toml` is an ordered list of rules. The rules use nixpkgs' own labels
 (`8.has: package (new)`, `8.has: module (new|update)`, `4.workflow: backport`, `10.rebuild-*`,
-`1.severity: security`, …), plus title conventions (`init at`, `a -> b`, `nixos/…`, `treewide:`)
-and changed paths for PRs the label bot hasn't handled yet. The first matching rule becomes the
+`1.severity: security`, …), plus title conventions (`init at`, `a -> b`, `nixos/…`, `treewide:`,
+`attr: …`) for PRs the label bot hasn't handled yet. The first matching rule becomes the
 PR's primary category, and every matching rule is kept as a tag. Topics come from the
 `6.topic: *` labels.
 
@@ -91,14 +91,12 @@ safe: the sync time only advances when a sync completes, so the next refresh cat
 Shows the PR's metadata, the status of both jobs (`not run`, `pending` with queue time,
 `running` with duration, `success`/`failed` with the result summary, `cancelled`), and an output
 pane. While a job runs, the pane follows its live log; once it finishes, the pane shows the
-report; when no job has run for the PR, it opens on the `files` tab. That tab lists the changed files with change type and lines added and deleted per
-file. PRs synced before per-file counts were stored have their file list fetched once (1 API
-request) when you open that tab; `triage update --full` refreshes all of them.
+report.
 
 | key | action |
 |---|---|
 | `c` / `n` | start the guideline check / nixpkgs-review |
-| `tab` | switch the output pane: guideline check → nixpkgs-review → files |
+| `tab` | switch the output pane between the two jobs |
 | `l` | toggle log / report |
 | `x` | cancel the shown job (asks first) |
 | `P` | post the nixpkgs-review report as a comment on the PR (no confirmation) |
@@ -139,10 +137,15 @@ not found, nixpkgs checkout not a git repo) is saved with a warning.
 The same data as the curses UI on one endlessly scrolling page: the category sidebar with
 counts, the same filters and sort orders, and the same columns. Clicking a row expands its
 detail inline: metadata, job states, and tabs for the guideline check and nixpkgs-review
-(report, or the live log while the job runs, refreshed every 3s) and the changed files with
-per-file line counts and bars. Category, sort and filters are kept in the URL, so views can be
-bookmarked. The page checks for new data every 30s. If the list is scrolled to the top with no
-detail open, it reloads the list; otherwise it shows a "new data" button.
+(report, or the live log while the job runs, refreshed every 3s). Category, sort and filters
+are kept in the URL, so views can be bookmarked. The page checks for new data every 30s. If the
+list is scrolled to the top with no detail open, it reloads the list; otherwise it shows a "new
+data" button.
+
+To stay fast: the first view is one API request, and the filtered and sorted list is cached until
+the data changes, so later pages and category switches answer in well under a millisecond. JSON
+is gzipped, static files are revalidated by ETag, and connections are kept alive. Opening a
+detail fetches the PR and the shown job output in parallel.
 
 It is **read-only**: no starting, cancelling or posting jobs, and no authentication. Anyone who
 can reach it sees the PR data and the job reports and logs. For hosting, keep it on localhost

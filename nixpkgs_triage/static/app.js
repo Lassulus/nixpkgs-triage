@@ -5,7 +5,7 @@ const STATUS_POLL_MS = 30000;
 const OUTPUT_POLL_MS = 3000;
 const COLUMNS = 11;
 
-let meta = null; // /api/status: filter and sort definitions, sync state
+let meta = null; // filter and sort definitions, from the first /api/prs response
 let state = null; // {category, sort, filters}
 let listGeneration = null;
 let next = null; // cursor of the next page; null when the list is complete
@@ -55,22 +55,14 @@ function duration(ms) {
 const since = (ts) => duration(Date.now() - Date.parse(ts));
 const until = (ts) => duration(Date.parse(ts) - Date.now());
 
-function stateFromUrl() {
-  const q = new URLSearchParams(location.search);
-  const filters = {};
-  for (const f of meta.filters) {
-    const v = q.get(f.key);
-    filters[f.key] = f.options.includes(v) ? v : f.options[0];
-  }
-  const sort = meta.sorts.includes(q.get("sort")) ? q.get("sort") : meta.sorts[0];
-  return { category: q.get("category") || "all", sort, filters };
-}
-
 function query(extra = {}) {
-  const q = new URLSearchParams();
-  if (state.category !== "all") q.set("category", state.category);
-  if (state.sort !== meta.sorts[0]) q.set("sort", state.sort);
-  for (const f of meta.filters) if (state.filters[f.key] !== f.options[0]) q.set(f.key, state.filters[f.key]);
+  // Before the first response the URL query goes to the server as is; it validates and normalizes it.
+  const q = new URLSearchParams(state ? "" : location.search);
+  if (state) {
+    if (state.category !== "all") q.set("category", state.category);
+    if (state.sort !== meta.sorts[0]) q.set("sort", state.sort);
+    for (const f of meta.filters) if (state.filters[f.key] !== f.options[0]) q.set(f.key, state.filters[f.key]);
+  }
   for (const [k, v] of Object.entries(extra)) q.set(k, v);
   return q;
 }
@@ -154,7 +146,7 @@ function prRow(pr) {
       "data-number": pr.number,
       onclick: (e) => {
         if (e.target.closest("a") || window.getSelection().toString()) return;
-        toggleDetail(tr, pr.number);
+        toggleDetail(tr, pr);
       },
     },
     el("td", {}, el("a", { href: `https://github.com/NixOS/nixpkgs/pull/${pr.number}`, target: "_blank" }, `#${pr.number}`)),
@@ -192,10 +184,13 @@ async function loadPage() {
     const page = await api(`/api/prs?${query(next ? { after: next } : {})}`, controller.signal);
     if (loading !== controller) return;
     if (!firstPageLoaded) {
+      meta = { filters: page.filters, sorts: page.sorts };
+      state = page.state;
       listGeneration = page.generation;
       categoryList = page.categories;
       renderToolbar();
       renderCategories();
+      renderStatus(page);
       $("#counts").textContent =
         `${page.matching} of ${page.total_open} open match the filters` +
         (state.category === "all" ? "" : `, ${page.count} in ${state.category}`);
@@ -236,31 +231,33 @@ function closeAllDetails() {
   for (const number of [...openDetails.keys()]) closeDetail(number);
 }
 
-async function toggleDetail(tr, number) {
+async function toggleDetail(tr, row) {
+  const number = row.number;
   if (openDetails.has(number)) {
     closeDetail(number);
     return;
   }
   const box = el("div", { class: "detail-box" }, "loading…");
-  const row = el("tr", { class: "detail" }, el("td", { colspan: COLUMNS }, box));
-  tr.after(row);
+  const detailRow = el("tr", { class: "detail" }, el("td", { colspan: COLUMNS }, box));
+  tr.after(detailRow);
   tr.classList.add("open");
-  const d = { row, prRow: tr, box, timer: null, tab: null, log: false };
+  // Start on the guideline check unless only the review ran; fetch its output alongside the details.
+  const d = { row: detailRow, prRow: tr, box, timer: null, tab: row.check || !row.review ? "check" : "review", log: false };
   openDetails.set(number, d);
+  const output = row[d.tab] ? api(`/api/pr/${number}/${d.tab}`) : null;
+  output?.catch(() => {}); // reported by loadOutput, if the details load at all
   try {
     d.pr = await api(`/api/pr/${number}`);
   } catch (e) {
     box.textContent = `loading failed: ${e.message}`;
     return;
   }
-  // Start on the output that exists: the check, else the review, else the changed files.
-  d.tab = d.pr.jobs.check ? "check" : d.pr.jobs.review ? "review" : "files";
-  renderDetail(number);
+  renderDetail(number, output);
 }
 
 const JOB_TITLES = { check: "guideline check", review: "nixpkgs-review" };
 
-function renderDetail(number) {
+function renderDetail(number, output = null) {
   const d = openDetails.get(number);
   if (!d) return;
   const pr = d.pr;
@@ -287,7 +284,7 @@ function renderDetail(number) {
       el("span", { class: "add" }, `+${pr.additions}`),
       " ",
       el("span", { class: "del" }, `-${pr.deletions}`),
-      ` in ${pr.files_total} files · CI: ${pr.ci} · comments: ${pr.comments} · mark: ${pr.mark || "-"}`,
+      ` in ${pr.changed_files} files · CI: ${pr.ci} · comments: ${pr.comments} · mark: ${pr.mark || "-"}`,
     ),
     el("dt", {}, "labels"),
     el("dd", {}, list(pr.labels)),
@@ -318,9 +315,8 @@ function renderDetail(number) {
     { class: "tabs" },
     tab("check", "guideline check"),
     tab("review", "nixpkgs-review"),
-    tab("files", `files (${pr.files_total})`),
     el("span", { class: "spacer" }),
-    d.tab !== "files" && pr.jobs[d.tab]
+    pr.jobs[d.tab]
       ? el(
           "button",
           {
@@ -336,46 +332,10 @@ function renderDetail(number) {
   const pane = el("div", {});
   d.box.replaceChildren(info, jobs, tabs, pane);
   clearTimeout(d.timer);
-  if (d.tab === "files") pane.append(filesTable(pr));
-  else loadOutput(number, pane);
+  loadOutput(number, pane, output);
 }
 
-function filesTable(pr) {
-  if (!pr.files.length) return el("p", { class: "dim" }, "no files");
-  const counted = pr.files[0].additions !== null;
-  const max = Math.max(1, ...pr.files.map((f) => (f.additions || 0) + (f.deletions || 0)));
-  const rows = pr.files.map((f) =>
-    el(
-      "tr",
-      {},
-      el("td", { class: "num add" }, counted ? `+${f.additions}` : ""),
-      el("td", { class: "num del" }, counted ? `-${f.deletions}` : ""),
-      el(
-        "td",
-        {},
-        counted
-          ? el(
-              "span",
-              { class: "bar" },
-              el("span", { class: "a", style: `width:${(100 * f.additions) / max}%` }),
-              el("span", { class: "d", style: `width:${(100 * f.deletions) / max}%` }),
-            )
-          : null,
-      ),
-      el("td", { class: "dim" }, f.change),
-      el("td", { class: "path" }, f.path),
-    ),
-  );
-  const notes = [];
-  if (!counted) notes.push(el("p", { class: "dim" }, "per-file line counts arrive with the next sync of this PR"));
-  if (pr.files_total > pr.files.length)
-    notes.push(
-      el("p", { class: "dim" }, `… ${pr.files_total - pr.files.length} more files (GitHub lists the first ${pr.files.length})`),
-    );
-  return el("div", {}, el("table", { class: "files" }, el("tbody", {}, rows)), notes);
-}
-
-async function loadOutput(number, pane) {
+async function loadOutput(number, pane, output = null) {
   const d = openDetails.get(number);
   const kind = d.tab;
   if (!d.pr.jobs[kind]) {
@@ -384,7 +344,7 @@ async function loadOutput(number, pane) {
   }
   let out;
   try {
-    out = await api(`/api/pr/${number}/${kind}${d.log ? "?log=1" : ""}`);
+    out = await (output ?? api(`/api/pr/${number}/${kind}${d.log ? "?log=1" : ""}`));
   } catch (e) {
     pane.replaceChildren(el("p", {}, `loading failed: ${e.message}`));
     return;
@@ -431,11 +391,7 @@ async function pollStatus() {
   setTimeout(pollStatus, STATUS_POLL_MS);
 }
 
-async function main() {
-  meta = await api("/api/status");
-  state = stateFromUrl();
-  renderToolbar();
-  renderStatus(meta);
+function main() {
   $("#reload").addEventListener("click", () => {
     window.scrollTo(0, 0);
     reloadList();

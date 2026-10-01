@@ -34,18 +34,13 @@ class Categorizer:
                     "description": c.get("description", ""),
                     "labels": set(c.get("labels", [])),
                     "authors": set(c.get("authors", [])),
-                    **{
-                        key: re.compile(c[key])
-                        for key in ("title", "base", "files_any", "files_added", "files_all")
-                        if key in c
-                    },
+                    **{key: re.compile(c[key]) for key in ("title", "base") if key in c},
                 }
             )
         self.names = [c["name"] for c in self.categories] + [self.fallback]
 
     @staticmethod
     def _matches(c: dict, pr: dict) -> bool:
-        files = pr["files"]
         if c["labels"] & set(pr["labels"]):
             return True
         if pr["author"] in c["authors"]:
@@ -54,14 +49,6 @@ class Categorizer:
             return True
         if "base" in c and c["base"].search(pr["base_ref"] or ""):
             return True
-        if "files_any" in c and any(c["files_any"].search(f[0]) for f in files):
-            return True
-        if "files_added" in c and any(f[1] == "ADDED" and c["files_added"].search(f[0]) for f in files):
-            return True
-        # Only trust "all files" rules when we saw the complete file list.
-        if "files_all" in c and files and len(files) >= (pr["files_total"] or 0):
-            if all(c["files_all"].search(f[0]) for f in files):
-                return True
         return False
 
     def classify(self, pr: dict) -> tuple[str, list[str], list[str]]:
@@ -71,11 +58,10 @@ class Categorizer:
 
 
 def recategorize(db: sqlite3.Connection, cat: Categorizer) -> int:
-    rows = db.execute("SELECT number, title, author, base_ref, labels, files, files_total FROM prs").fetchall()
+    rows = db.execute("SELECT number, title, author, base_ref, labels FROM prs").fetchall()
     for r in rows:
         pr = dict(r)
         pr["labels"] = json.loads(pr["labels"])
-        pr["files"] = json.loads(pr["files"])
         primary, tags, topics = cat.classify(pr)
         db.execute(
             "UPDATE prs SET category = ?, tags = ?, topics = ? WHERE number = ?",

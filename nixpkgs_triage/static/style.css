@@ -142,14 +142,6 @@ tr.detail > td { padding: 0 !important; white-space: normal !important; backgrou
   word-break: break-word;
 }
 .output.log { white-space: pre; }
-table.files { border-collapse: collapse; font-variant-numeric: tabular-nums; }
-table.files td { padding: .1em .6em .1em 0; white-space: nowrap; }
-table.files td.num { text-align: right; }
-table.files td.path { font-family: ui-monospace, monospace; font-size: .92em; }
-.bar { display: inline-flex; height: .7em; width: 8em; vertical-align: middle; }
-.bar span { display: block; height: 100%; }
-.bar .a { background: var(--green); }
-.bar .d { background: var(--red); }
 
 @media (max-width: 800px) {
   nav#categories { display: none; }

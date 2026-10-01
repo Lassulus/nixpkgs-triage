@@ -1,14 +1,11 @@
 # PR categories, derived from nixpkgs' own labels (8.has:*, 4.workflow:*, 10.rebuild-*, ...)
-# plus title/path conventions for PRs the label bot hasn't handled.
+# plus title conventions for PRs the label bot hasn't handled.
 #
 # A category matches when ANY of its criteria matches:
 #   labels      - PR carries one of these exact labels
 #   authors     - PR author login
 #   title       - regex searched in the title
 #   base        - regex searched in the base branch name
-#   files_any   - regex; some changed file matches
-#   files_added - regex; some *added* file matches
-#   files_all   - regex; every changed file matches (only if the full file list (<=100) is known)
 #
 # Order matters: the first match is the PR's primary category (the review queue it lands in),
 # every match is kept as a tag (`triage list --tag nixos-module`).
@@ -52,8 +49,6 @@ name = "nixos-module-new"
 description = "New NixOS module / service"
 labels = ["8.has: module (new)"]
 title = '^nixos/(?!tests/)[^:]+: (init|add module)\b'
-# new modules must be registered here; refactors that touch it are rare
-files_any = '^nixos/modules/module-list\.nix$'
 
 [[category]]
 name = "new-package"
@@ -68,18 +63,18 @@ title = '(?i)^treewide\b'
 
 [[category]]
 name = "docs"
-description = "Documentation only"
-files_all = '(^doc/|^nixos/doc/|\.md$)'
+description = "Documentation"
+title = '^(doc|docs|manual|nixos/doc|nixos/manual)\b'
 
 [[category]]
 name = "maintainers"
-description = "Only maintainer / team list changes"
-files_all = '^maintainers/(maintainer-list|team-list)\.nix$'
+description = "Maintainer / team list changes"
+title = '^maintainers\b'
 
 [[category]]
 name = "nixos-test"
-description = "Only NixOS tests changed"
-files_all = '^nixos/tests/'
+description = "NixOS tests"
+title = '^(nixos/tests?|nixosTests)\b'
 
 [[category]]
 name = "package-update-bot"
@@ -97,7 +92,6 @@ name = "nixos-module"
 description = "Changes to existing NixOS modules / services"
 labels = ["8.has: module (update)"]
 title = '^nixos/'
-files_any = '^nixos/modules/'
 
 [[category]]
 name = "removal"
@@ -109,20 +103,32 @@ title = '(?i)\b(drop|remove|removal|deprecate)\b'
 name = "ci-tooling"
 description = "CI, GitHub workflows, maintainer scripts"
 labels = ["6.topic: continuous integration", "github_actions"]
-files_all = '^(\.github/|ci/|maintainers/scripts/|\.editorconfig$|\.git-blame-ignore-revs$)'
+title = '^(ci|\.github|workflows?|actions)\b'
 
 [[category]]
 name = "lib"
 description = "Nixpkgs library (lib/)"
 title = '^lib[./:]'
-files_all = '^(lib/|flake\.nix$)'
 
 [[category]]
 name = "package-fix"
 description = "Other package changes (build fixes, options, refactors)"
-files_any = '^pkgs/'
+# Rebuilds some packages (larger rebuilds are mass-rebuild), or follows nixpkgs' commit convention
+# "attr: description", "attr1, {attr2,attr3}: description", optionally after "[WIP] ".
+labels = [
+  "10.rebuild-linux: 1",
+  "10.rebuild-linux: 1-10",
+  "10.rebuild-linux: 11-100",
+  "10.rebuild-linux: 101-500",
+  "10.rebuild-darwin: 1",
+  "10.rebuild-darwin: 1-10",
+  "10.rebuild-darwin: 11-100",
+  "10.rebuild-darwin: 101-500",
+]
+title = '^(\[\w+\] ?|WIP:? )?[\w.+{},*/-]+(, ?[\w.+{},*/-]+)*: '
 
 [[category]]
 name = "nixos-other"
 description = "NixOS infrastructure outside modules (test driver, image builders, release)"
-files_any = '^nixos/'
+labels = ["6.topic: nixos"]
+title = '^nixos\b'

@@ -53,7 +53,8 @@ def filter_ok(r: dict, jobs: Jobs, key: str, value: str) -> bool:
 
 
 def visible_rows(rows: list[dict], jobs: Jobs, filters: dict[str, str]) -> list[dict]:
-    return [r for r in rows if all(filter_ok(r, jobs, key, v) for key, v in filters.items())]
+    active = [(key, v) for key, v in filters.items() if v not in ("show", "any")]
+    return [r for r in rows if all(filter_ok(r, jobs, key, v) for key, v in active)]
 
 
 def category_counts(names: list[str], visible: list[dict]) -> list[tuple[str, int]]:

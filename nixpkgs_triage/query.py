@@ -140,7 +140,7 @@ def cmd_list(args: argparse.Namespace) -> None:
         out = []
         for r in rows:
             d = dict(r)
-            for k in ("labels", "files", "tags", "topics"):
+            for k in ("labels", "tags", "topics"):
                 d[k] = json.loads(d[k])
             out.append(d)
         json.dump(out, sys.stdout, indent=2)
@@ -171,7 +171,6 @@ def show(db: sqlite3.Connection, number: int) -> None:
     ).fetchone()
     if r is None:
         sys.exit(f"#{number} is not in the database (run `triage update`)")
-    files = json.loads(r["files"])
     print(f"#{r['number']} {r['title']}")
     print(f"  {pr_url(r['number'])}")
     print(f"  state:     {r['state']}{' (draft)' if r['is_draft'] else ''} -> {r['base_ref']}")
@@ -179,7 +178,7 @@ def show(db: sqlite3.Connection, number: int) -> None:
     print(f"  created:   {r['created_at']} ({age(r['created_at'])} ago), updated {r['updated_at']}")
     print(f"  category:  {r['category']}  tags: {', '.join(json.loads(r['tags'])) or '-'}")
     print(f"  topics:    {', '.join(json.loads(r['topics'])) or '-'}")
-    print(f"  size:      +{r['additions']}/-{r['deletions']} in {r['files_total']} files, {r['comments']} comments")
+    print(f"  size:      +{r['additions']}/-{r['deletions']} in {r['changed_files']} files, {r['comments']} comments")
     print(f"  CI:        {r['ci_state'] or '-'}   review decision: {r['review_decision'] or '-'}")
     print(f"  labels:    {', '.join(json.loads(r['labels'])) or '-'}")
     if r["review_status"]:
@@ -189,12 +188,6 @@ def show(db: sqlite3.Connection, number: int) -> None:
     jobs = latest_jobs(db, number)
     print(f"  check:     {job_describe(jobs.get((number, 'check')))}")
     print(f"  nixpkgs-review: {job_describe(jobs.get((number, 'review')))}")
-    print("  files:")
-    for f in files[:25]:
-        counts = f"+{f[2]}/-{f[3]}" if len(f) > 2 else ""
-        print(f"    {f[1][0]} {counts:>12}  {f[0]}")
-    if r["files_total"] > 25:
-        print(f"    ... {r['files_total'] - 25} more")
 
 
 def cmd_show(args: argparse.Namespace) -> None:

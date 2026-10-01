@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import gzip
+import hashlib
 import json
 import signal
 import socket
@@ -49,6 +51,17 @@ STATIC_FILES = {
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
 }
+
+
+def load_static() -> dict[str, tuple[bytes, bytes, str, str]]:
+    """URL path -> (body, gzipped body, content type, ETag), read once at startup."""
+    static = {}
+    for path, (name, content_type) in STATIC_FILES.items():
+        body = (STATIC_DIR / name).read_bytes()
+        static[path] = (body, gzip.compress(body, 9), content_type, f'"{hashlib.sha256(body).hexdigest()[:16]}"')
+    return static
+
+
 PAGE_SIZE = 100
 MAX_PAGE_SIZE = 500
 # How often requests look for database changes (syncs, job runners, the curses UI all write to it).
@@ -191,16 +204,29 @@ class Dashboard(ThreadingHTTPServer):
         super().__init__(address, Handler)
         self.snapshot = snapshot
         self.sync = sync
+        self.static = load_static()
+        # (filters, sort) -> (visible rows, sorted rows, category counts) for the current data generation
+        self.lists: dict = {}
+        self.lists_generation = -1
 
-    def status(self) -> dict:
-        data = self.snapshot.current()
+    def sorted_list(self, data: Data, filters: dict[str, str], sort: str) -> tuple[list, list, list]:
+        """Filtered and sorted open PRs, cached until the data changes, so scrolling and category switches are cheap."""
+        if self.lists_generation != data.generation or len(self.lists) > 32:
+            self.lists, self.lists_generation = {}, data.generation
+        key = (tuple(filters.items()), sort)
+        if key not in self.lists:
+            visible = visible_rows(data.rows, data.jobs, filters)
+            counts = category_counts(self.snapshot.category_names, visible)
+            self.lists[key] = (visible, sorted_rows(visible, sort), counts)
+        return self.lists[key]
+
+    def status(self, data: Data | None = None) -> dict:
+        data = data or self.snapshot.current()
         return {
             "generation": data.generation,
             "last_sync": data.last_sync,
             "total_open": len(data.rows),
             "sync": self.sync.state() if self.sync else None,
-            "filters": [{"key": k, "label": label, "options": options} for k, label, options in FILTERS],
-            "sorts": [s[0] for s in SORTS],
         }
 
     def prs(self, params: dict[str, str]) -> dict:
@@ -219,9 +245,9 @@ class Dashboard(ThreadingHTTPServer):
             raise BadRequest("limit must be a number") from None
         category = params.get("category", "all")
 
-        visible = visible_rows(data.rows, data.jobs, filters)
-        prs = visible if category == "all" else [r for r in visible if r["category"] == category]
-        prs = sorted_rows(prs, sort)
+        visible, prs, counts = self.sorted_list(data, filters, sort)
+        if category != "all":
+            prs = [r for r in prs if r["category"] == category]
         _, column, descending = next(s for s in SORTS if s[0] == sort)
         start = 0
         if params.get("after"):
@@ -241,11 +267,13 @@ class Dashboard(ThreadingHTTPServer):
         page = prs[start : start + limit]
         more = start + limit < len(prs)
         return {
-            "generation": data.generation,
-            "last_sync": data.last_sync,
-            "total_open": len(data.rows),
+            **self.status(data),
+            # The page builds its controls from these, so its first load is a single API request.
+            "filters": [{"key": k, "label": label, "options": options} for k, label, options in FILTERS],
+            "sorts": [s[0] for s in SORTS],
+            "state": {"category": category, "sort": sort, "filters": filters},
             "matching": len(visible),
-            "categories": category_counts(self.snapshot.category_names, visible),
+            "categories": counts,
             "count": len(prs),
             "prs": [row_json(r, data.jobs) for r in page],
             "next": sort_cursor(page[-1], column) if more else None,
@@ -260,15 +288,6 @@ class Dashboard(ThreadingHTTPServer):
         if pr is None:
             raise NotFound(f"PR #{number} is not in the database")
         jobs = self.snapshot.current().jobs
-        files = [
-            {
-                "path": f[0],
-                "change": f[1].lower(),
-                "additions": f[2] if len(f) > 2 else None,
-                "deletions": f[3] if len(f) > 3 else None,
-            }
-            for f in json.loads(pr["files"])
-        ]
         return {
             "number": number,
             "url": pr_url(number),
@@ -290,8 +309,7 @@ class Dashboard(ThreadingHTTPServer):
             "note": pr["review_note"],
             "additions": pr["additions"],
             "deletions": pr["deletions"],
-            "files_total": pr["files_total"],
-            "files": files,
+            "changed_files": pr["changed_files"],
             "jobs": {kind: job_json(jobs.get((number, kind))) for kind in JOB_TITLES},
         }
 
@@ -312,15 +330,15 @@ class Dashboard(ThreadingHTTPServer):
 class Handler(BaseHTTPRequestHandler):
     server: Dashboard
     server_version = "nixpkgs-triage"
+    protocol_version = "HTTP/1.1"  # keep-alive; every response has a Content-Length
 
     def do_GET(self) -> None:
         url = urlsplit(self.path)
         params = {k: v[-1] for k, v in parse_qs(url.query).items()}
         parts = url.path.strip("/").split("/")
         try:
-            if url.path in STATIC_FILES:
-                name, content_type = STATIC_FILES[url.path]
-                self.send(HTTPStatus.OK, (STATIC_DIR / name).read_bytes(), content_type, "no-cache")
+            if url.path in self.server.static:
+                self.send_static(*self.server.static[url.path])
             elif url.path == "/api/status":
                 self.send_json(self.server.status())
             elif url.path == "/api/prs":
@@ -336,14 +354,32 @@ class Handler(BaseHTTPRequestHandler):
         except NotFound as e:
             self.send_json({"error": str(e)}, HTTPStatus.NOT_FOUND)
 
-    def send_json(self, value: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
-        self.send(status, json.dumps(value).encode(), "application/json", "no-store")
+    def send_static(self, body: bytes, gzipped: bytes, content_type: str, etag: str) -> None:
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(HTTPStatus.NOT_MODIFIED)
+            self.send_header("ETag", etag)
+            self.end_headers()
+            return
+        self.send(HTTPStatus.OK, body, content_type, "no-cache", etag=etag, gzipped=gzipped)
 
-    def send(self, status: HTTPStatus, body: bytes, content_type: str, cache: str) -> None:
+    def send_json(self, value: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
+        body = json.dumps(value, separators=(",", ":")).encode()
+        self.send(status, body, "application/json", "no-store", gzipped=gzip.compress(body, 5))
+
+    def send(
+        self, status: HTTPStatus, body: bytes, content_type: str, cache: str, etag: str = "", gzipped: bytes = b""
+    ) -> None:
+        compress = bool(gzipped) and "gzip" in self.headers.get("Accept-Encoding", "")
         self.send_response(status)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", cache)
+        self.send_header("Vary", "Accept-Encoding")
+        if etag:
+            self.send_header("ETag", etag)
+        if compress:
+            self.send_header("Content-Encoding", "gzip")
+            body = gzipped
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
@@ -363,6 +399,7 @@ def parse_listen(listen: str) -> tuple[str, int]:
 def cmd_serve(args: argparse.Namespace) -> None:
     address = parse_listen(args.listen)
     snapshot = Snapshot()
+    snapshot.current()  # load the PRs now rather than in the first request
     sync = SyncLoop(args.sync_every) if args.sync_every > 0 else None
     server = Dashboard(address, snapshot, sync)
 
