@@ -142,8 +142,10 @@ class GitHub:
                 self._sleep_until_epoch(int(headers.get("x-ratelimit-reset", time.time() + 60)), "GraphQL RATE_LIMITED")
                 continue
             data = payload.get("data")
-            if data is None:
-                raise RuntimeError(f"GraphQL error: {errors}")
+            # NOT_FOUND only means a requested node is gone (closed PRs looked up by id); anything else is fatal.
+            fatal = [err.get("message") for err in errors if err.get("type") != "NOT_FOUND"]
+            if data is None or fatal:
+                raise RuntimeError(f"GraphQL error: {fatal or errors}")
             rl = data.get("rateLimit")
             if rl:
                 self.points_used += rl["cost"]
