@@ -24,6 +24,7 @@ fragment PR on PullRequest {
   labels(first: 50) { nodes { name } }
   commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
   comments { totalCount }
+  latestOpinionatedReviews(first: 30) { nodes { state author { login } } }
 }
 """
 

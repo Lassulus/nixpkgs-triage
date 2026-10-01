@@ -35,7 +35,21 @@ from .util import TriageError, age, log, pr_url, since
 PAGE_SIZE = 100
 DEFAULTS = {"category": "all", "sort": SORTS[0][0], **DEFAULT_FILTERS, "q": ""}
 OPTIONS = {"sort": [s[0] for s in SORTS], **{key: options for key, _, options in FILTERS}}
-COLUMNS = ("PR", "age", "+/-", "CI", "conflict", "draft", "mark", "check", "nixrev", "category", "title")
+COLUMNS = (
+    "PR",
+    "age",
+    "+/-",
+    "CI",
+    "conflict",
+    "draft",
+    "mark",
+    "check",
+    "nixrev",
+    "approved by",
+    "author",
+    "category",
+    "title",
+)
 
 CSS = """
 :root { color-scheme: light dark; --add: light-dark(#2e7d32, #6cc070); --del: light-dark(#c62828, #ef6b6b); }
@@ -50,7 +64,7 @@ main { margin-left: 15em; padding: 0 1em; }
 form { display: flex; flex-wrap: wrap; gap: 1em; padding: .5em 0; }
 input[type=search] { width: 20em; }
 summary, .head { display: grid; gap: .6em; padding: .15em 0; white-space: nowrap;
-  grid-template-columns: 5em 2.5em 7em 4.5em 4.5em 3em 3.5em 3.5em 3.5em 9em 1fr;
+  grid-template-columns: 5em 2.5em 7em 4.5em 4.5em 3em 3.5em 3.5em 3.5em 8em 8em 9em 1fr;
   border-bottom: 1px solid color-mix(in srgb, GrayText 30%, transparent); }
 summary { cursor: pointer; list-style: none; }
 summary > * { overflow: hidden; text-overflow: ellipsis; }
@@ -189,6 +203,7 @@ def row_html(r: dict, jobs: Jobs) -> str:
     n = r["number"]
     check, review = job_short(jobs.get((n, "check"))), job_short(jobs.get((n, "review")))
     failing = "failing" if r["ci_state"] in ("FAILURE", "ERROR") else ""
+    approvers = escape(", ".join(json.loads(r["approvals"] or "[]")))
     return (
         f'<details data-n="{n}"><summary class="{"draft" if r["is_draft"] else ""}">'
         f"<span>#{n}</span><span>{age(r['created_at'])}</span>"
@@ -196,8 +211,8 @@ def row_html(r: dict, jobs: Jobs) -> str:
         f'<span class="{failing}">{ci_label(r["ci_state"])}</span><span>{"yes" if r["conflict"] else ""}</span>'
         f"<span>{'yes' if r['is_draft'] else ''}</span><span>{escape(review_marker(r))}</span>"
         f'<span class="{check}">{check}</span><span class="{review}">{review}</span>'
-        f'<span class="dim">{escape(r["category"])}</span>'
-        f'<span>{escape(r["title"])} <span class="dim">{escape(r["author"] or "")}</span></span>'
+        f'<span class="pass" title="{approvers}">{approvers}</span><span>{escape(r["author"] or "")}</span>'
+        f'<span class="dim">{escape(r["category"])}</span><span>{escape(r["title"])}</span>'
         f'</summary><div class="pane">loading…</div></details>'
     )
 
@@ -288,7 +303,7 @@ class Dashboard(ThreadingHTTPServer):
         jobs = self.snapshot.current().jobs
 
         def joined(column: str) -> str:
-            return escape(", ".join(json.loads(pr[column]))) or "-"
+            return escape(", ".join(json.loads(pr[column] or "[]"))) or "-"
 
         lines = [
             f'<a href="{pr_url(number)}" target="_blank">{pr_url(number)}</a>',
@@ -297,6 +312,7 @@ class Dashboard(ThreadingHTTPServer):
             f"updated {since(pr['updated_at'])} ago",
             f"tags: {joined('tags')} · topics: {joined('topics')}",
             f"+{pr['additions']} -{pr['deletions']} in {pr['changed_files']} files · {pr['comments']} comments",
+            f"approved by: {joined('approvals')}",
             f"labels: {joined('labels')}",
         ]
         for kind, title in JOB_TITLES.items():

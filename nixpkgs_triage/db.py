@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 
 from .config import DB_PATH
+from .util import iso, utcnow
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS prs (
@@ -27,6 +28,7 @@ CREATE TABLE IF NOT EXISTS prs (
   ci_state TEXT,
   comments INTEGER,
   labels TEXT NOT NULL,
+  approvals TEXT,
   category TEXT,
   tags TEXT,
   topics TEXT,
@@ -67,9 +69,15 @@ def open_db(check_same_thread: bool = True) -> sqlite3.Connection:
     db.execute("PRAGMA journal_mode=WAL")
     db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)
+    columns = {r["name"] for r in db.execute("PRAGMA table_info(prs)")}
     # Older databases still have these dropped columns.
-    for column in {"files", "files_total"}.intersection(r["name"] for r in db.execute("PRAGMA table_info(prs)")):
+    for column in {"files", "files_total"} & columns:
         db.execute(f"ALTER TABLE prs DROP COLUMN {column}")
+    if "approvals" not in columns:
+        # Added later: a full sync fills it in for every open PR.
+        db.execute("ALTER TABLE prs ADD COLUMN approvals TEXT")
+        meta_set(db, "full_sync_run", iso(utcnow()))
+        db.commit()
     return db
 
 

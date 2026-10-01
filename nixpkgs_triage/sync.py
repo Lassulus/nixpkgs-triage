@@ -85,6 +85,14 @@ def node_to_row(node: dict) -> dict:
         "ci_state": rollup["state"] if rollup else None,
         "comments": node["comments"]["totalCount"],
         "labels": [l["name"] for l in node["labels"]["nodes"]],
+        # Reviewers whose latest approving-or-requesting-changes review approves.
+        "approvals": json.dumps(
+            [
+                (r["author"] or {}).get("login", "ghost")
+                for r in node["latestOpinionatedReviews"]["nodes"]
+                if r["state"] == "APPROVED"
+            ]
+        ),
     }
 
 

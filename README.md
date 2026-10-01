@@ -61,10 +61,12 @@ PR comment.
 ./triage serve --listen '[::]:8080' --sync-every 0
 ```
 
-The curses list as one endlessly scrolling, server-rendered page; click a PR for its details and
-reports. The search box filters live with fuzzy matching on number, title and author (`pyth req`
-finds `python3Packages.requests`). Filters and search live in the URL. It only reads the database (the sync loop is the only thing
-talking to GitHub), is read-only and has no authentication: put it behind a reverse proxy.
+The curses list as one endlessly scrolling, server-rendered page, plus `approved by` (reviewers
+whose latest review approves) and `author` columns; click a PR for its details and reports. The
+search box filters live with fuzzy matching on number, title and author (`pyth req` finds
+`python3Packages.requests`). Filters and search live in the URL. It only reads the database (the
+sync loop is the only thing talking to GitHub), is read-only and has no authentication: put it
+behind a reverse proxy.
 
 ### NixOS module
 
