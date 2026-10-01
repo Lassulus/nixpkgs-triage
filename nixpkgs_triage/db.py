@@ -63,9 +63,9 @@ CREATE INDEX IF NOT EXISTS jobs_number_kind ON jobs(number, kind);
 """
 
 
-def open_db() -> sqlite3.Connection:
+def open_db(check_same_thread: bool = True) -> sqlite3.Connection:
     # Job runners write from their own processes: WAL keeps readers unblocked, the timeout waits out writers.
-    db = sqlite3.connect(DB_PATH, timeout=30)
+    db = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=check_same_thread)
     db.execute("PRAGMA journal_mode=WAL")
     db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)

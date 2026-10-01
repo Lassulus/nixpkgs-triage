@@ -24,6 +24,7 @@ from .settings import cmd_settings
 from .sync import cmd_update
 from .ui import cmd_ui
 from .util import TriageError
+from .web import cmd_serve
 
 
 def main() -> None:
@@ -71,6 +72,16 @@ def main() -> None:
 
     p = sub.add_parser("ui", help="interactive curses browser (categories, open in browser, refresh)")
     p.set_defaults(func=cmd_ui)
+
+    p = sub.add_parser("serve", help="web dashboard (read-only) with a background sync")
+    p.add_argument("--listen", default="127.0.0.1:8080", help="HOST:PORT to listen on (default 127.0.0.1:8080)")
+    p.add_argument(
+        "--sync-every",
+        type=float,
+        default=300,
+        help="seconds between `triage update` runs (default 300; 0 = don't sync, e.g. when a timer does it)",
+    )
+    p.set_defaults(func=cmd_serve)
 
     for kind, what in (("check", "guideline check with omp"), ("review", "nixpkgs-review")):
         p = sub.add_parser(kind, help=f"start a background {what} for PRs")

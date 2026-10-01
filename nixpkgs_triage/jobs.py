@@ -16,11 +16,14 @@ from .config import ENTRY, JOBS_DIR, ROOT
 from .db import open_db
 from .github import ADD_COMMENT_MUTATION, GitHub, github_token
 from .settings import agent_argv, load_settings, nixpkgs_dir, review_argv
-from .util import TriageError, fmt_duration, iso, parse_ts, pr_url, since, utcnow
+from .util import TriageError, fmt_duration, iso, parse_ts, pr_url, read_tail, since, utcnow
 
 JOB_TITLES = {"check": "guideline check", "review": "nixpkgs-review"}
 
 ACTIVE_JOB_STATES = ("pending", "running")
+
+# Logs can be long (nix build output); views show their end.
+LOG_TAIL_BYTES = 512 * 1024
 
 # Runners started by this process; polled so finished ones don't linger as zombies.
 SPAWNED: list[subprocess.Popen] = []
@@ -66,6 +69,19 @@ def latest_jobs(db: sqlite3.Connection, number: int | None = None) -> dict[tuple
         f"SELECT * FROM jobs WHERE id IN (SELECT MAX(id) FROM jobs {where} GROUP BY number, kind)", params
     ).fetchall()
     return {(r["number"], r["kind"]): r for r in rows}
+
+
+def job_output(job: sqlite3.Row, want_log: bool) -> tuple[Path, bool]:
+    """The file to show for a job and whether it is the log: the report once finished, otherwise the live log."""
+    jobdir = Path(job["dir"])
+    report = jobdir / "report.md"
+    use_log = want_log or job["status"] in ACTIVE_JOB_STATES or not report.exists() or report.stat().st_size == 0
+    return (jobdir / "job.log" if use_log else report), use_log
+
+
+def output_lines(path: Path) -> list[str]:
+    """The (tail of a) job output file as lines; carriage-return progress output keeps its final state."""
+    return [raw.rsplit("\r", 1)[-1].replace("\t", "    ") for raw in read_tail(path, LOG_TAIL_BYTES).splitlines()]
 
 
 def job_short(job: sqlite3.Row | None) -> str:

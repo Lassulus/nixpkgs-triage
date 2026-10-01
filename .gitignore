@@ -4,3 +4,4 @@
 /triage.db-shm
 /jobs/
 __pycache__/
+/triage.db.sync.lock

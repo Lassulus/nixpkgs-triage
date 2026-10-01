@@ -3,21 +3,63 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
+import signal
 import sqlite3
+import subprocess
+import sys
+import threading
 import time
 from datetime import timedelta
 
 from .categorize import Categorizer, load_categorizer
-from .config import DB_PATH, OWNER, REPO
+from .config import DB_PATH, ENTRY, OWNER, REPO
 from .db import meta_get, meta_set, open_db
 from .github import NODES_QUERY, PAGE_QUERY, GitHub, ServerTimeout, github_token
-from .util import iso, log, parse_ts, utcnow
+from .util import TriageError, iso, log, parse_ts, utcnow
 
 # Incremental syncs re-read this much before the previous watermark to absorb clock skew.
 SYNC_OVERLAP = timedelta(minutes=5)
 
 MIN_PAGE_SIZE = 5
+
+# Held by a running `triage update`, so the UI, the web daemon and manual runs never sync concurrently.
+SYNC_LOCK_PATH = DB_PATH.with_name(DB_PATH.name + ".sync.lock")
+
+
+class SyncJob:
+    """`triage update` in a child process; its log lines are collected (and echoed to stderr if asked)."""
+
+    def __init__(self, echo: bool = False) -> None:
+        self.lines: list[str] = []
+        self.echo = echo
+        self.proc = subprocess.Popen(
+            [sys.executable, str(ENTRY), "update"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        self.thread = threading.Thread(target=self._read, daemon=True)
+        self.thread.start()
+
+    def _read(self) -> None:
+        for line in self.proc.stdout:
+            self.lines.append(line.rstrip("\n"))
+            if self.echo:
+                print(f"sync: {self.lines[-1]}", file=sys.stderr, flush=True)
+        self.proc.wait()
+
+    @property
+    def running(self) -> bool:
+        return self.thread.is_alive()
+
+    def cancel(self) -> None:
+        # SIGINT takes the "interrupted, progress is saved" path; every page is committed.
+        if self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGINT)
 
 
 def node_to_row(node: dict) -> dict:
@@ -183,6 +225,11 @@ def sync_incremental(gh: GitHub, db: sqlite3.Connection, cat: Categorizer, page_
 
 
 def cmd_update(args: argparse.Namespace) -> None:
+    lock = open(SYNC_LOCK_PATH, "w")  # released when the process ends
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise TriageError("another `triage update` is running; not starting a second one") from None
     db = open_db()
     cat = load_categorizer(db)
     gh = GitHub(github_token(), delay=args.delay, reserve=args.reserve)

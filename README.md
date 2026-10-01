@@ -3,7 +3,7 @@
 A local review workflow for open NixOS/nixpkgs PRs. It mirrors them into SQLite (`triage.db`),
 sorts each one into a review queue using `categories.toml`, keeps your review state locally, and
 runs per-PR background jobs: an omp agent that checks the contribution guidelines, and
-nixpkgs-review.
+nixpkgs-review. You browse it in a curses UI or a web dashboard.
 
 Needs Python ≥ 3.11 (stdlib only) and a GitHub token: `GITHUB_TOKEN`/`GH_TOKEN`, or `gh auth token`.
 Guideline checks need `omp`; nixpkgs-review needs `nix` and a nixpkgs git checkout (`~/src/nixpkgs`).
@@ -128,6 +128,67 @@ resets it to the default. Values are checked when you save: commands must parse 
 program should be in PATH, and counts must be ≥ 1. A value that parses but looks wrong (program
 not found, nixpkgs checkout not a git repo) is saved with a warning.
 
+## Web dashboard
+
+```sh
+./triage serve                                   # http://127.0.0.1:8080/, syncs every 5 minutes
+./triage serve --listen '[::]:8080' --sync-every 120
+./triage serve --sync-every 0                    # no sync loop (a timer or you run `triage update`)
+```
+
+The same data as the curses UI on one endlessly scrolling page: the category sidebar with
+counts, the same filters and sort orders, and the same columns. Clicking a row expands its
+detail inline: metadata, job states, and tabs for the guideline check and nixpkgs-review
+(report, or the live log while the job runs, refreshed every 3s) and the changed files with
+per-file line counts and bars. Category, sort and filters are kept in the URL, so views can be
+bookmarked. The page checks for new data every 30s. If the list is scrolled to the top with no
+detail open, it reloads the list; otherwise it shows a "new data" button.
+
+It is **read-only**: no starting, cancelling or posting jobs, and no authentication. Anyone who
+can reach it sees the PR data and the job reports and logs. For hosting, keep it on localhost
+behind a reverse proxy that adds TLS and, if needed, auth.
+
+The server keeps the open PRs in memory and reloads them when the database changes (syncs, job
+runners and the curses UI write to the same `triage.db`). Its sync loop runs `triage update`
+`--sync-every` seconds (default 300) after the previous run ended, and the sync log goes to
+stderr. An incremental run costs about 2 points per 50 changed PRs, so even a 1-minute interval
+stays far below GitHub's 5000 points/hour. Only one `triage update` runs at a time: a second one
+(the UI's `R`, a manual run) exits with "another `triage update` is running".
+
+JSON API: `/api/status`, `/api/prs?category=&sort=&<filter>=&after=&limit=` (keyset-paged; `next`
+is the cursor for `after`), `/api/pr/N`, `/api/pr/N/check|review[?log=1]`.
+
+As a NixOS service (the token comes from the environment, since `gh` usually isn't logged in
+there):
+
+```nix
+systemd.services.nixpkgs-triage = {
+  wantedBy = [ "multi-user.target" ];
+  after = [ "network-online.target" ];
+  wants = [ "network-online.target" ];
+  path = [ pkgs.python3 pkgs.git pkgs.nix ];
+  serviceConfig = {
+    ExecStart = "/path/to/nixpkgs-triage/triage serve --listen 127.0.0.1:8080";
+    EnvironmentFile = "/run/secrets/nixpkgs-triage";  # GITHUB_TOKEN=…
+    User = "lass";
+    Restart = "on-failure";
+  };
+};
+```
+
+### Push updates from GitHub
+
+Webhooks for NixOS/nixpkgs need admin rights on that repository (or a GitHub App installed by
+the NixOS org), so a third-party dashboard can't receive them. The ways to get close:
+
+- **Poll more often** (what the sync loop does): the incremental query already asks "what changed
+  since last time", so `--sync-every 60` gives about 1-minute freshness for about 120 points/hour.
+- **Repository events API** (`GET /repos/NixOS/nixpkgs/events` with `If-None-Match`): 304
+  responses don't count against the rate limit, so it could trigger a sync only when something
+  happened. GitHub delays events by 30s to 6h, and the feed holds only the latest 300 events,
+  which on nixpkgs can cover less than a polling interval. It works as a trigger, not as the source
+  of truth.
+
 ## Background jobs
 
 ```sh
@@ -230,8 +291,10 @@ Environment: `TRIAGE_DB`, `TRIAGE_CATEGORIES` and `TRIAGE_JOBS_DIR` override the
 | `github.py` | rate-limit-aware GraphQL client and queries |
 | `db.py` | SQLite schema |
 | `categorize.py` | categories.toml rules |
-| `sync.py` | `update`: full and incremental sync |
+| `sync.py` | `update`: full and incremental sync; `SyncJob` (`update` as a child process) |
 | `query.py` | `list`, `next`, `show`, `mark`, `stats` |
 | `jobs.py` | starting, tracking, cancelling jobs; posting reports |
 | `runner.py` | the detached runner: guideline check and nixpkgs-review |
+| `listing.py` | the open-PR list shared by both UIs: filters, sort orders, category counts |
 | `ui.py` | curses UI |
+| `web.py`, `static/` | `serve`: web dashboard, JSON API, sync loop |

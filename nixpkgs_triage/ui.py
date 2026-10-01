@@ -6,19 +6,12 @@ import argparse
 import curses
 import json
 import os
-import signal
 import sqlite3
-import subprocess
-import sys
 import textwrap
-import threading
 import time
-from collections import Counter
 from collections.abc import Callable
-from pathlib import Path
 
 from .categorize import Categorizer, load_categorizer
-from .config import ENTRY
 from .db import meta_get, open_db
 from .jobs import (
     ACTIVE_JOB_STATES,
@@ -26,51 +19,28 @@ from .jobs import (
     SPAWNED,
     cancel_job,
     job_describe,
+    job_output,
     job_short,
     latest_jobs,
+    output_lines,
     post_review,
     reap_jobs,
     start_job,
 )
-from .query import MERGE_CONFLICT_LABEL, ci_label, review_marker
+from .listing import (
+    DEFAULT_FILTERS,
+    FILTERS,
+    SORTS,
+    category_counts,
+    filter_summary,
+    load_open_rows,
+    sorted_rows,
+    visible_rows,
+)
+from .query import ci_label, review_marker
 from .settings import SETTINGS, load_settings, save_setting, stored_settings
-from .sync import refresh_pr
-from .util import TriageError, age, open_url, pr_url, read_tail, since
-
-
-class SyncJob:
-    """`triage update` in a child process; its log lines are collected for the refresh view."""
-
-    def __init__(self) -> None:
-        self.lines: list[str] = []
-        self.proc = subprocess.Popen(
-            [sys.executable, str(ENTRY), "update"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            start_new_session=True,
-        )
-        self.thread = threading.Thread(target=self._read, daemon=True)
-        self.thread.start()
-
-    def _read(self) -> None:
-        for line in self.proc.stdout:
-            self.lines.append(line.rstrip("\n"))
-        self.proc.wait()
-
-    @property
-    def running(self) -> bool:
-        return self.thread.is_alive()
-
-    def cancel(self) -> None:
-        # SIGINT takes the "interrupted, progress is saved" path; every page is committed.
-        if self.proc.poll() is None:
-            self.proc.send_signal(signal.SIGINT)
-
-
-# (label, column, descending)
-UI_SORTS = (("oldest", "created_at", False), ("newest", "created_at", True), ("updated", "updated_at", True))
+from .sync import SyncJob, refresh_pr
+from .util import TriageError, age, open_url, pr_url, since
 
 # PR, age, +/-, CI, conflict, draft, mark, check, nixrev, title
 UI_PR_FORMAT = " {:<8} {:>4} {:<13} {:<7} {:<8} {:<5} {:<6.6} {:<7} {:<7} {}"
@@ -81,16 +51,6 @@ UI_HELP = (
 )
 UI_FILTER_HELP = "↑↓ select  ←→/space change  r reset all  q back"
 
-# (key, label, options); the first option is the default. Filters last for the session.
-FILTERS = (
-    ("drafts", "drafts", ("hide", "show", "only")),
-    ("conflicts", "merge conflicts", ("hide", "show", "only")),
-    ("ci", "CI", ("any", "not failing", "failing")),
-    ("check", "guideline check", ("any", "not run", "pass", "issues", "failed")),
-    ("review", "nixpkgs-review", ("any", "not run", "pass", "failed")),
-)
-# Filter options -> job_short() values
-JOB_FILTER_STATES = {"pass": "pass", "issues": "issues", "failed": "FAIL"}
 UI_SETTINGS_HELP = "↑↓ select  enter edit  r reset to default  q back"
 UI_EDIT_HELP = "enter save  esc cancel  ←→ home end ctrl-u"
 
@@ -101,8 +61,6 @@ DETAIL_TABS = ("check", "review", "files")
 
 JOB_POLL_SECONDS = 2.0
 
-LOG_TAIL_BYTES = 512 * 1024
-
 
 class TriageUI:
     def __init__(self, scr: curses.window, db: sqlite3.Connection, cat: Categorizer):
@@ -111,7 +69,7 @@ class TriageUI:
         self.cat = cat
         self.focus = "cats"
         self.view = "list"
-        self.filters = {key: options[0] for key, _, options in FILTERS}
+        self.filters = dict(DEFAULT_FILTERS)  # filters last for the session
         self.filter_idx = 0
         self.sort_idx = 0
         self.cat_idx = 0
@@ -154,14 +112,7 @@ class TriageUI:
     # data
 
     def load(self) -> None:
-        rows = self.db.execute(
-            "SELECT p.number, p.title, p.author, p.category, p.is_draft, p.created_at, p.updated_at, "
-            "p.ci_state, p.additions, p.deletions, r.status AS review_status, r.pr_updated_at AS reviewed_version, "
-            "EXISTS (SELECT 1 FROM json_each(p.labels) WHERE value = ?) AS conflict "
-            "FROM prs p LEFT JOIN reviews r ON r.number = p.number WHERE p.state = 'OPEN'",
-            (MERGE_CONFLICT_LABEL,),
-        ).fetchall()
-        self.all_rows = [dict(r) for r in rows]
+        self.all_rows = load_open_rows(self.db)
         self.last_sync = meta_get(self.db, "last_sync")
         if self.detail:
             self.detail["pr"] = self.load_pr(self.detail["pr"]["number"])
@@ -187,41 +138,19 @@ class TriageUI:
         if self.all_rows and (self.filters["check"] != "any" or self.filters["review"] != "any"):
             self.apply()  # job states changed, so the job filters may match different PRs
 
-    def filter_ok(self, r: dict, key: str, value: str) -> bool:
-        if key in ("drafts", "conflicts"):
-            flag = bool(r["is_draft"] if key == "drafts" else r["conflict"])
-            return {"hide": not flag, "show": True, "only": flag}[value]
-        if key == "ci":
-            failing = r["ci_state"] in ("FAILURE", "ERROR")
-            return {"any": True, "not failing": not failing, "failing": failing}[value]
-        job = self.jobs.get((r["number"], key))
-        if value == "any":
-            return True
-        if value == "not run":
-            return job is None
-        return job is not None and job_short(job) == JOB_FILTER_STATES[value]
-
     def filter_summary(self) -> str:
-        active = [
-            f"{label} {self.filters[key]}"
-            for key, label, options in FILTERS
-            if self.filters[key] not in ("show", "any")
-        ]
-        return ", ".join(active) or "none"
+        return filter_summary(self.filters)
 
     def apply(self) -> None:
         """Recompute category counts and the PR list, keeping the selected PR if it is still listed."""
         keep = self.prs[self.pr_idx]["number"] if self.prs else None
-        visible = [r for r in self.all_rows if all(self.filter_ok(r, key, v) for key, v in self.filters.items())]
+        visible = visible_rows(self.all_rows, self.jobs, self.filters)
         self.visible_count = len(visible)
-        counts = Counter(r["category"] for r in visible)
-        names = self.cat.names + sorted(set(counts) - set(self.cat.names))
-        self.categories = [("all", len(visible))] + [(n, counts.get(n, 0)) for n in names]
+        self.categories = category_counts(self.cat.names, visible)
         self.cat_idx = min(self.cat_idx, len(self.categories) - 1)
         selected = self.categories[self.cat_idx][0]
         prs = visible if selected == "all" else [r for r in visible if r["category"] == selected]
-        _, column, descending = UI_SORTS[self.sort_idx]
-        prs.sort(key=lambda r: r[column], reverse=descending)
+        prs = sorted_rows(prs, SORTS[self.sort_idx][0])
         self.prs = prs
         numbers = [r["number"] for r in prs]
         self.pr_idx = numbers.index(keep) if keep in numbers else min(self.pr_idx, max(len(prs) - 1, 0))
@@ -316,7 +245,7 @@ class TriageUI:
     def draw_list(self, h: int, w: int) -> None:
         body = h - 3  # title bar, column header, footer
         header = (
-            f" nixpkgs-triage  {self.visible_count} of {len(self.all_rows)} open  sort: {UI_SORTS[self.sort_idx][0]}  "
+            f" nixpkgs-triage  {self.visible_count} of {len(self.all_rows)} open  sort: {SORTS[self.sort_idx][0]}  "
             f"filters: {self.filter_summary()}  last sync: {self.last_sync or 'never'}"
         )
         self.put(0, 0, header, w, curses.A_REVERSE)
@@ -407,21 +336,16 @@ class TriageUI:
         if job is None:
             key = "c" if kind == "check" else "n"
             return f"{JOB_TITLES[kind]}: no output", ["", f"not run yet, press {key} to start it"], False
-        jobdir = Path(job["dir"])
-        report, logfile = jobdir / "report.md", jobdir / "job.log"
-        active = job["status"] in ACTIVE_JOB_STATES
-        use_log = self.detail["log"] or active or not report.exists() or report.stat().st_size == 0
-        path = logfile if use_log else report
+        path, use_log = job_output(job, self.detail["log"])
         if not path.exists():
             return f"{JOB_TITLES[kind]}: {path}", ["", "(no output yet)"], use_log
         lines: list[str] = []
-        for raw in read_tail(path, LOG_TAIL_BYTES).splitlines():
-            raw = raw.rsplit("\r", 1)[-1].replace("\t", "    ")  # progress output: keep the final state
+        for raw in output_lines(path):
             if use_log:
                 lines.append(raw)
             else:
                 lines.extend(textwrap.wrap(raw, width, drop_whitespace=False) or [""])
-        what = ("live log" if active else "log") if use_log else "report"
+        what = ("live log" if job["status"] in ACTIVE_JOB_STATES else "log") if use_log else "report"
         return f"{JOB_TITLES[kind]} {what}: {path}", lines, use_log
 
     def draw_detail(self, h: int, w: int) -> None:
@@ -562,7 +486,7 @@ class TriageUI:
             self.filters[fkey] = options[(options.index(self.filters[fkey]) + step) % len(options)]
             self.apply()
         elif key == ord("r"):
-            self.filters = {k: opts[0] for k, _, opts in FILTERS}
+            self.filters = dict(DEFAULT_FILTERS)
             self.apply()
 
     def handle_settings_key(self, key: int) -> None:
@@ -664,7 +588,7 @@ class TriageUI:
         elif key == ord("f"):
             self.view = "filters"
         elif key == ord("o"):
-            self.sort_idx = (self.sort_idx + 1) % len(UI_SORTS)
+            self.sort_idx = (self.sort_idx + 1) % len(SORTS)
             # A new order starts at the top instead of scrolling to the previous selection.
             self.prs, self.pr_idx, self.pr_top = [], 0, 0
             self.apply()
