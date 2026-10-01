@@ -167,7 +167,7 @@ The flake exports `nixosModules.default` (and `packages.<system>.default`):
 
 ```nix
 {
-  inputs.nixpkgs-triage.url = "git+https://…/nixpkgs-triage";  # or path:/home/lass/src/nixpkgs-triage
+  inputs.nixpkgs-triage.url = "github:Lassulus/nixpkgs-triage";
 
   outputs = { nixpkgs, nixpkgs-triage, ... }: {
     nixosConfigurations.server = nixpkgs.lib.nixosSystem {
