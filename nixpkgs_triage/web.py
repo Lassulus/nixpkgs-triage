@@ -46,12 +46,24 @@ COLUMNS = (
     "mark",
     "check",
     "nixrev",
+    "likes",
     "approved by",
     "blocked by",
     "author",
     "category",
     "title",
 )
+# GitHub reaction names
+EMOJI = {
+    "THUMBS_UP": "👍",
+    "HEART": "❤️",
+    "HOORAY": "🎉",
+    "ROCKET": "🚀",
+    "LAUGH": "😄",
+    "EYES": "👀",
+    "CONFUSED": "😕",
+    "THUMBS_DOWN": "👎",
+}
 
 CSS = """
 :root { color-scheme: light dark; --add: light-dark(#2e7d32, #6cc070); --del: light-dark(#c62828, #ef6b6b); }
@@ -66,7 +78,7 @@ main { margin-left: 15em; padding: 0 1em; }
 form { display: flex; flex-wrap: wrap; gap: 1em; padding: .5em 0; }
 input[type=search] { width: 20em; }
 summary, .head { display: grid; padding: .15em 0; white-space: nowrap;
-  grid-template-columns: 1.6em 5.6em 3.1em 7.6em 5.1em 5.1em 3.6em 4.1em 4.1em 4.8em 8.6em 8.6em 8.6em 11em 1fr;
+  grid-template-columns: 1.6em 5.6em 3.1em 7.6em 5.1em 5.1em 3.6em 4.1em 4.1em 4.8em 3.6em 8.6em 8.6em 8.6em 11em 1fr;
   border-bottom: 1px solid color-mix(in srgb, GrayText 30%, transparent); }
 summary { list-style: none; }
 summary:hover { background: color-mix(in srgb, GrayText 12%, Canvas); }
@@ -222,6 +234,7 @@ def row_html(r: dict, jobs: Jobs) -> str:
         ("", escape(review_marker(r))),
         (check, check),
         (review, review),
+        ("", r["likes"] or ""),
         ("pass", approvers),
         ("failing", blockers),
         ("author", author),
@@ -275,7 +288,8 @@ class Dashboard(ThreadingHTTPServer):
         start = 0
         if after:
             value, _, number = after.rpartition("|")
-            cursor = (value, int(number or 0))
+            # Same type as the sort column (likes are numbers), so it compares with the rows' keys.
+            cursor = (type(prs[0][column])(value) if prs else value, int(number or 0))
 
             def past(r: dict) -> bool:
                 key = (r[column], r["number"])
@@ -337,6 +351,10 @@ class Dashboard(ThreadingHTTPServer):
             f"tags: {joined('tags')} · topics: {joined('topics')}",
             f"+{pr['additions']} -{pr['deletions']} in {pr['changed_files']} files · {pr['comments']} comments",
             f"approved by: {joined('approvals')} · changes requested by: {joined('blocking')}",
+            "reactions: "
+            + (
+                " ".join(f"{EMOJI[k]} {n}" for k, n in json.loads(pr["reactions"] or "{}").items() if k in EMOJI) or "-"
+            ),
             f"labels: {joined('labels')}",
         ]
         for kind, title in JOB_TITLES.items():

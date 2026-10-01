@@ -45,7 +45,7 @@ Categories on the left, their PRs on the right. Columns: `age`, `+/-` (lines), `
 | `space` | detail view |
 | `c` / `n` | start guideline check / nixpkgs-review |
 | `f` | filters: drafts, merge conflicts (hidden by default), CI, check, review |
-| `o` | sort: oldest, newest, recently updated |
+| `o` | sort: oldest, newest, recently updated, most liked |
 | `R` | run `triage update` and show its log |
 | `S` | settings |
 | `q` | quit |
@@ -61,8 +61,9 @@ PR comment.
 ./triage serve --listen '[::]:8080' --sync-every 0
 ```
 
-The curses list as one endlessly scrolling, server-rendered page, plus `approved by` and
-`blocked by` (reviewers whose latest review approves / requests changes) and `author` columns.
+The curses list as one endlessly scrolling, server-rendered page, plus `likes` (👍 ❤️ 🎉 🚀
+reactions on the PR; sort by `most liked` to see which new packages people want), `approved by`
+and `blocked by` (reviewers whose latest review approves / requests changes) and `author` columns.
 Clicking a row opens the PR on GitHub, clicking
 the author their profile; `▸` folds out the details and reports. The
 search box filters live with fuzzy matching on number, title and author (`pyth req` finds

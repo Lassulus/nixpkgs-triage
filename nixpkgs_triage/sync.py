@@ -100,6 +100,9 @@ def node_to_row(node: dict) -> dict:
         # Reviewers by their latest approving-or-requesting-changes review.
         "approvals": reviewers(node, "APPROVED"),
         "blocking": reviewers(node, "CHANGES_REQUESTED"),
+        "reactions": json.dumps(
+            {g["content"]: g["reactors"]["totalCount"] for g in node["reactionGroups"] if g["reactors"]["totalCount"]}
+        ),
     }
 
 

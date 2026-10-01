@@ -9,7 +9,14 @@ from .jobs import job_short
 from .query import MERGE_CONFLICT_LABEL
 
 # (label, column, descending)
-SORTS = (("oldest", "created_at", False), ("newest", "created_at", True), ("updated", "updated_at", True))
+SORTS = (
+    ("oldest", "created_at", False),
+    ("newest", "created_at", True),
+    ("updated", "updated_at", True),
+    ("most liked", "likes", True),
+)
+# Reactions that count as likes
+LIKES = ("THUMBS_UP", "HEART", "HOORAY", "ROCKET")
 
 # (key, label, options); the first option is the default.
 FILTERS = (
@@ -31,9 +38,10 @@ def load_open_rows(db: sqlite3.Connection) -> list[dict]:
         "SELECT p.number, p.title, p.author, p.category, p.is_draft, p.created_at, p.updated_at, "
         "p.ci_state, p.additions, p.deletions, p.approvals, p.blocking, r.status AS review_status, "
         "r.pr_updated_at AS reviewed_version, "
+        "(SELECT COALESCE(SUM(value), 0) FROM json_each(p.reactions) WHERE key IN (?, ?, ?, ?)) AS likes, "
         "EXISTS (SELECT 1 FROM json_each(p.labels) WHERE value = ?) AS conflict "
         "FROM prs p LEFT JOIN reviews r ON r.number = p.number WHERE p.state = 'OPEN'",
-        (MERGE_CONFLICT_LABEL,),
+        (*LIKES, MERGE_CONFLICT_LABEL),
     ).fetchall()
     return [dict(r) for r in rows]
 

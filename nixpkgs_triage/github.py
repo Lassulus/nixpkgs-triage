@@ -25,6 +25,7 @@ fragment PR on PullRequest {
   commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
   comments { totalCount }
   latestOpinionatedReviews(first: 30) { nodes { state author { login } } }
+  reactionGroups { content reactors { totalCount } }
 }
 """
 
