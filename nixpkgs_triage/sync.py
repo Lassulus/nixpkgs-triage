@@ -69,6 +69,11 @@ def author_login(author: dict | None) -> str | None:
     return author["login"] + ("[bot]" if author.get("__typename") == "Bot" else "")
 
 
+def reviewers(node: dict, state: str) -> str:
+    reviews = node["latestOpinionatedReviews"]["nodes"]
+    return json.dumps([(r["author"] or {}).get("login", "ghost") for r in reviews if r["state"] == state])
+
+
 def node_to_row(node: dict) -> dict:
     commits = node["commits"]["nodes"]
     rollup = commits[0]["commit"]["statusCheckRollup"] if commits else None
@@ -92,14 +97,9 @@ def node_to_row(node: dict) -> dict:
         "ci_state": rollup["state"] if rollup else None,
         "comments": node["comments"]["totalCount"],
         "labels": [l["name"] for l in node["labels"]["nodes"]],
-        # Reviewers whose latest approving-or-requesting-changes review approves.
-        "approvals": json.dumps(
-            [
-                (r["author"] or {}).get("login", "ghost")
-                for r in node["latestOpinionatedReviews"]["nodes"]
-                if r["state"] == "APPROVED"
-            ]
-        ),
+        # Reviewers by their latest approving-or-requesting-changes review.
+        "approvals": reviewers(node, "APPROVED"),
+        "blocking": reviewers(node, "CHANGES_REQUESTED"),
     }
 
 

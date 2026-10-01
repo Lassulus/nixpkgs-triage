@@ -29,7 +29,7 @@ Jobs = dict[tuple[int, str], sqlite3.Row]
 def load_open_rows(db: sqlite3.Connection) -> list[dict]:
     rows = db.execute(
         "SELECT p.number, p.title, p.author, p.category, p.is_draft, p.created_at, p.updated_at, "
-        "p.ci_state, p.additions, p.deletions, p.approvals, r.status AS review_status, "
+        "p.ci_state, p.additions, p.deletions, p.approvals, p.blocking, r.status AS review_status, "
         "r.pr_updated_at AS reviewed_version, "
         "EXISTS (SELECT 1 FROM json_each(p.labels) WHERE value = ?) AS conflict "
         "FROM prs p LEFT JOIN reviews r ON r.number = p.number WHERE p.state = 'OPEN'",

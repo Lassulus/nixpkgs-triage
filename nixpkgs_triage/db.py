@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS prs (
   comments INTEGER,
   labels TEXT NOT NULL,
   approvals TEXT,
+  blocking TEXT,
   category TEXT,
   tags TEXT,
   topics TEXT,
@@ -73,10 +74,12 @@ def open_db(check_same_thread: bool = True) -> sqlite3.Connection:
     # Older databases still have these dropped columns.
     for column in {"files", "files_total"} & columns:
         db.execute(f"ALTER TABLE prs DROP COLUMN {column}")
-    if "approvals" not in columns:
-        # Added later: a full sync fills it in for every open PR.
-        db.execute("ALTER TABLE prs ADD COLUMN approvals TEXT")
+    if added := [c for c in ("approvals", "blocking") if c not in columns]:
+        # Added later: a full sync from the start fills them in for every open PR.
+        for column in added:
+            db.execute(f"ALTER TABLE prs ADD COLUMN {column} TEXT")
         meta_set(db, "full_sync_run", iso(utcnow()))
+        meta_set(db, "full_sync_cursor", None)
         db.commit()
     return db
 

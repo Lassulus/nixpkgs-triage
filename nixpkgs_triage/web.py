@@ -47,6 +47,7 @@ COLUMNS = (
     "check",
     "nixrev",
     "approved by",
+    "blocked by",
     "author",
     "category",
     "title",
@@ -65,7 +66,7 @@ main { margin-left: 15em; padding: 0 1em; }
 form { display: flex; flex-wrap: wrap; gap: 1em; padding: .5em 0; }
 input[type=search] { width: 20em; }
 summary, .head { display: grid; padding: .15em 0; white-space: nowrap;
-  grid-template-columns: 1.6em 5.6em 3.1em 7.6em 5.1em 5.1em 3.6em 4.1em 4.1em 4.8em 8.6em 8.6em 11em 1fr;
+  grid-template-columns: 1.6em 5.6em 3.1em 7.6em 5.1em 5.1em 3.6em 4.1em 4.1em 4.8em 8.6em 8.6em 8.6em 11em 1fr;
   border-bottom: 1px solid color-mix(in srgb, GrayText 30%, transparent); }
 summary { list-style: none; }
 summary:hover { background: color-mix(in srgb, GrayText 12%, Canvas); }
@@ -209,7 +210,7 @@ def fuzzy(q: str):
 def row_html(r: dict, jobs: Jobs) -> str:
     n = r["number"]
     check, review = job_short(jobs.get((n, "check"))), job_short(jobs.get((n, "review")))
-    approvers = escape(", ".join(json.loads(r["approvals"] or "[]")))
+    approvers, blockers = (escape(", ".join(json.loads(r[column] or "[]"))) for column in ("approvals", "blocking"))
     author = escape(r["author"] or "")
     cells = [
         ("", f"#{n}"),
@@ -222,6 +223,7 @@ def row_html(r: dict, jobs: Jobs) -> str:
         (check, check),
         (review, review),
         ("pass", approvers),
+        ("failing", blockers),
         ("author", author),
         ("dim", escape(r["category"])),
         ("", escape(r["title"])),
@@ -334,7 +336,7 @@ class Dashboard(ThreadingHTTPServer):
             f"updated {since(pr['updated_at'])} ago",
             f"tags: {joined('tags')} · topics: {joined('topics')}",
             f"+{pr['additions']} -{pr['deletions']} in {pr['changed_files']} files · {pr['comments']} comments",
-            f"approved by: {joined('approvals')}",
+            f"approved by: {joined('approvals')} · changes requested by: {joined('blocking')}",
             f"labels: {joined('labels')}",
         ]
         for kind, title in JOB_TITLES.items():
