@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import re
 import signal
 import socket
 import threading
@@ -32,7 +33,7 @@ from .sync import SyncJob
 from .util import TriageError, age, log, pr_url, since
 
 PAGE_SIZE = 100
-DEFAULTS = {"category": "all", "sort": SORTS[0][0], **DEFAULT_FILTERS}
+DEFAULTS = {"category": "all", "sort": SORTS[0][0], **DEFAULT_FILTERS, "q": ""}
 OPTIONS = {"sort": [s[0] for s in SORTS], **{key: options for key, _, options in FILTERS}}
 COLUMNS = ("PR", "age", "+/-", "CI", "conflict", "draft", "mark", "check", "nixrev", "category", "title")
 
@@ -47,6 +48,7 @@ nav a { display: flex; justify-content: space-between; padding: 0 1em; color: in
 nav a.sel { background: Highlight; color: HighlightText; }
 main { margin-left: 15em; padding: 0 1em; }
 form { display: flex; flex-wrap: wrap; gap: 1em; padding: .5em 0; }
+input[type=search] { width: 20em; }
 summary, .head { display: grid; gap: .6em; padding: .15em 0; white-space: nowrap;
   grid-template-columns: 5em 2.5em 7em 4.5em 4.5em 3em 3.5em 3.5em 3.5em 9em 1fr;
   border-bottom: 1px solid color-mix(in srgb, GrayText 30%, transparent); }
@@ -87,6 +89,21 @@ const more = new IntersectionObserver(async ([e]) => {
 }, { rootMargin: "1000px" });
 const first = document.querySelector("a.more");
 if (first) more.observe(first);
+// Live search: replace the rows as you type; the newest response wins.
+const search = document.querySelector("input[name=q]");
+let searchTimer, searchSeq = 0;
+search.addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(async () => {
+    const seq = ++searchSeq, params = new URLSearchParams(new FormData(search.form));
+    history.replaceState(null, "", "?" + params);
+    const html = await (await fetch("/rows?" + params)).text();
+    if (seq !== searchSeq) return;
+    document.getElementById("rows").innerHTML = html || "<p class=dim>no PRs match</p>";
+    const next = document.querySelector("a.more");
+    if (next) more.observe(next);
+  }, 150);
+});
 """
 
 
@@ -153,13 +170,19 @@ class SyncLoop(threading.Thread):
 def parse_state(params: dict[str, str]) -> dict:
     state = dict(DEFAULTS)
     for k, v in params.items():
-        if k == "category" or v in OPTIONS.get(k, ()):
+        if k in ("category", "q") or v in OPTIONS.get(k, ()):
             state[k] = v
     return state
 
 
 def query(state: dict, **change) -> str:
     return urlencode({k: v for k, v in {**state, **change}.items() if v != DEFAULTS.get(k)})
+
+
+def fuzzy(q: str):
+    """Each word of q must match one word of '#number title author': its letters in order, gaps allowed."""
+    patterns = [re.compile(r"\S*?".join(map(re.escape, word)), re.I) for word in q.split()]
+    return lambda r: all(p.search(f"#{r['number']} {r['title']} {r['author']}") for p in patterns)
 
 
 def row_html(r: dict, jobs: Jobs) -> str:
@@ -207,6 +230,8 @@ class Dashboard(ThreadingHTTPServer):
         data, _, prs, _ = self.listing(state)
         if state["category"] != "all":
             prs = [r for r in prs if r["category"] == state["category"]]
+        if state["q"].strip():
+            prs = list(filter(fuzzy(state["q"]), prs))
         _, column, descending = next(s for s in SORTS if s[0] == state["sort"])
         start = 0
         if after:
@@ -220,6 +245,8 @@ class Dashboard(ThreadingHTTPServer):
             start = next((i for i, r in enumerate(prs) if past(r)), len(prs))
         page = prs[start : start + PAGE_SIZE]
         html = "".join(row_html(r, data.jobs) for r in page)
+        if state["q"].strip() and not after:
+            html = f'<p class="dim">{len(prs)} matching “{escape(state["q"])}”</p>' + html
         if start + PAGE_SIZE < len(prs):
             last = page[-1]
             html += f'<a class="more" href="/rows?{query(state, after=f"{last[column]}|{last["number"]}")}">more</a>'
@@ -247,9 +274,11 @@ class Dashboard(ThreadingHTTPServer):
             f'<title>nixpkgs-triage</title><link rel="icon" href="data:,"><style>{CSS}</style>'
             f"<header><b>nixpkgs-triage</b>{''.join(f'<span>{s}</span>' for s in status)}</header>"
             f"<nav>{cats}</nav><main>"
-            f'<form><input type="hidden" name="category" value="{escape(state["category"])}">{selects}</form>'
+            f'<form><input type="hidden" name="category" value="{escape(state["category"])}">'
+            f'<input type="search" name="q" value="{escape(state["q"])}" placeholder="fuzzy search" autofocus>'
+            f"{selects}</form>"
             f'<div class="head">{"".join(f"<span>{c}</span>" for c in COLUMNS)}</div>'
-            f"{self.rows(state) or '<p class=dim>no PRs match</p>'}</main><script>{JS}</script>"
+            f'<div id="rows">{self.rows(state) or "<p class=dim>no PRs match</p>"}</div></main><script>{JS}</script>'
         )
 
     def detail(self, number: int, tab: str, want_log: bool) -> str:

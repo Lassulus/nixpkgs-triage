@@ -62,7 +62,8 @@ PR comment.
 ```
 
 The curses list as one endlessly scrolling, server-rendered page; click a PR for its details and
-reports. Filters live in the URL. It only reads the database (the sync loop is the only thing
+reports. The search box filters live with fuzzy matching on number, title and author (`pyth req`
+finds `python3Packages.requests`). Filters and search live in the URL. It only reads the database (the sync loop is the only thing
 talking to GitHub), is read-only and has no authentication: put it behind a reverse proxy.
 
 ### NixOS module
