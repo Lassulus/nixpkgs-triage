@@ -5,20 +5,29 @@ into queues with `categories.toml`, tracks your review state, and runs per-PR jo
 checking the contribution guidelines, and nixpkgs-review). Browse it in a curses UI or a web
 dashboard.
 
-Needs Python ≥ 3.11 (stdlib only) and a GitHub token (`GITHUB_TOKEN`/`GH_TOKEN` or `gh auth token`).
+Needs Python ≥ 3.11 (stdlib only). Syncing from GitHub, jobs and posting need a GitHub token
+(`GITHUB_TOKEN`/`GH_TOKEN` or `gh auth token`).
 Guideline checks need `omp`; nixpkgs-review needs `nix` and a nixpkgs checkout (`~/src/nixpkgs`).
 `TRIAGE_DB`, `TRIAGE_CATEGORIES` and `TRIAGE_JOBS_DIR` override the file locations.
 
 ## Sync
 
 ```sh
-./triage update          # first run: full sync (~30 min), later: only PRs updated since the last sync
-./triage update --full   # re-walk every open PR
+./triage update            # pull from the sync server (default https://review.lassul.us)
+./triage update --github   # sync from GitHub directly
+./triage settings server '' # always sync from GitHub
 ```
 
-One GraphQL request per 50 PRs (1 point). Requests are serial with a 1s pause, the sync sleeps when
-fewer than `--reserve` (500) points remain, honours `Retry-After`, and halves the page size when
-GitHub times out. A full sync is resumable after Ctrl-C. Only one `triage update` runs at a time.
+By default `triage update` (and `R` in the curses UI) copies the PR data from a triage server
+(`triage serve`, which syncs GitHub itself) with one request: the first pull gets every PR (about
+1 MB), later ones only what the server changed since. No GitHub token is needed for that; your
+local categories, marks and jobs stay local.
+
+Syncing from GitHub: the first run is a full sync (~30 min), later runs only fetch PRs updated
+since the last sync; `--full` re-walks every open PR. One GraphQL request per 50 PRs (2 points).
+Requests are serial with a 1s pause, the sync sleeps when fewer than `--reserve` (500) points
+remain, honours `Retry-After`, and halves the page size when GitHub times out. A full sync is
+resumable after Ctrl-C. Only one `triage update` runs at a time.
 
 ## Categories
 
@@ -69,9 +78,10 @@ edge to resize (double-click resets); the layout is kept in the browser, "reset 
 it. Clicking a row opens the PR on GitHub, clicking the author their profile; `▸` folds out the
 details and reports. The
 search box filters live with fuzzy matching on number, title and author (`pyth req` finds
-`python3Packages.requests`). Filters and search live in the URL. It only reads the database (the
-sync loop is the only thing talking to GitHub), is read-only and has no authentication: put it
-behind a reverse proxy.
+`python3Packages.requests`). Filters and search live in the URL. It only reads the database (its
+sync loop, `triage update --github`, is the only thing talking to GitHub), is read-only and has no
+authentication: put it behind a reverse proxy. `GET /api/prs?since=TIME` returns the PR rows
+changed since then (all without `since`) as JSON, for clients' `triage update`.
 
 ### NixOS module
 
@@ -115,6 +125,7 @@ Cancelling sends SIGINT.
 
 | setting | default |
 |---|---|
+| `server` | `https://review.lassul.us` (empty: sync from GitHub) |
 | `agent_command` | `s omp` |
 | `agent_model` | omp's default |
 | `review_command` | `nixpkgs-review`, or `nix run nixpkgs#nixpkgs-review --` |

@@ -25,13 +25,20 @@ class Setting:
     label: str
     help: str
     default: str | Callable[[], str]
-    kind: str = "text"  # text | command | args | path | count
+    kind: str = "text"  # text | command | args | path | count | url
 
     def default_value(self) -> str:
         return self.default() if callable(self.default) else self.default
 
 
 SETTINGS = (
+    Setting(
+        "server",
+        "sync server",
+        "`triage update` copies PR data from this triage server instead of GitHub; empty syncs from GitHub",
+        "https://review.lassul.us",
+        "url",
+    ),
     Setting("agent_command", "agent command", "omp command used for guideline checks", "s omp", "command"),
     Setting(
         "agent_model",
@@ -87,6 +94,8 @@ def validate(key: str, value: str) -> str | None:
             raise TriageError(f"{setting.label} must be a number ≥ 1")
     elif setting.kind == "path" and not (Path(value).expanduser() / ".git").exists():
         return f"{value} is not a git checkout"
+    elif setting.kind == "url" and value and not value.startswith(("http://", "https://")):
+        raise TriageError(f"{setting.label} must be an http(s) URL or empty")
     return None
 
 

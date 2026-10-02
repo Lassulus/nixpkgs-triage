@@ -1,9 +1,10 @@
-"""Mirroring open PRs from GitHub into the local database."""
+"""Mirroring open PRs into the local database: from GitHub, or from a triage server that does that."""
 
 from __future__ import annotations
 
 import argparse
 import fcntl
+import gzip
 import json
 import signal
 import sqlite3
@@ -11,12 +12,15 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from datetime import timedelta
+from urllib.parse import quote
 
 from .categorize import Categorizer, load_categorizer
 from .config import DB_PATH, ENTRY, OWNER, REPO
 from .db import meta_get, meta_set, open_db
 from .github import NODES_QUERY, PAGE_QUERY, GitHub, ServerTimeout, github_token
+from .settings import load_settings
 from .util import TriageError, iso, log, parse_ts, utcnow
 
 # Incremental syncs re-read this much before the previous watermark to absorb clock skew.
@@ -29,13 +33,13 @@ SYNC_LOCK_PATH = DB_PATH.with_name(DB_PATH.name + ".sync.lock")
 
 
 class SyncJob:
-    """`triage update` in a child process; its log lines are collected (and echoed to stderr if asked)."""
+    """`triage update ARGS` in a child process; its log lines are collected (and echoed to stderr if asked)."""
 
-    def __init__(self, echo: bool = False) -> None:
+    def __init__(self, *args: str, echo: bool = False) -> None:
         self.lines: list[str] = []
         self.echo = echo
         self.proc = subprocess.Popen(
-            [sys.executable, str(ENTRY), "update"],
+            [sys.executable, str(ENTRY), "update", *args],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -108,12 +112,17 @@ def node_to_row(node: dict) -> dict:
 
 def upsert(db: sqlite3.Connection, cat: Categorizer, node: dict, seen_run: str | None = None) -> None:
     row = node_to_row(node)
-    row["category"], tags, topics = cat.classify(row)
-    row["tags"] = json.dumps(tags)
-    row["topics"] = json.dumps(topics)
     row["labels"] = json.dumps(row["labels"])
     row["seen_run"] = seen_run
     row["synced_at"] = iso(utcnow())
+    write_row(db, cat, row)
+
+
+def write_row(db: sqlite3.Connection, cat: Categorizer, row: dict) -> None:
+    """Insert or update a PR row (JSON columns as strings), categorized with the local categories.toml."""
+    row["category"], tags, topics = cat.classify({**row, "labels": json.loads(row["labels"])})
+    row["tags"] = json.dumps(tags)
+    row["topics"] = json.dumps(topics)
     cols = list(row)
     updates = ", ".join(
         f"{c} = excluded.{c}" if c != "seen_run" else "seen_run = COALESCE(excluded.seen_run, prs.seen_run)"
@@ -226,6 +235,26 @@ def sync_incremental(gh: GitHub, db: sqlite3.Connection, cat: Categorizer, page_
     db.commit()
 
 
+def sync_from_server(db: sqlite3.Connection, cat: Categorizer, server: str) -> None:
+    """Copy the PR rows a triage server (`triage serve`) changed since our last pull."""
+    since = meta_get(db, "server_since") or ""
+    url = f"{server.rstrip('/')}/api/prs?since={quote(since)}"
+    request = urllib.request.Request(url, headers={"Accept-Encoding": "gzip"})
+    with urllib.request.urlopen(request, timeout=120) as response:
+        body = response.read()
+        if response.headers.get("Content-Encoding") == "gzip":
+            body = gzip.decompress(body)
+    data = json.loads(body)
+    columns = {r["name"] for r in db.execute("PRAGMA table_info(prs)")} - {"seen_run", "category", "tags", "topics"}
+    for row in data["prs"]:
+        write_row(db, cat, {k: v for k, v in row.items() if k in columns})
+    # The server commits a sync page after stamping its rows, so re-read a little before its clock.
+    meta_set(db, "server_since", iso(parse_ts(data["now"]) - SYNC_OVERLAP))
+    meta_set(db, "last_sync", data["last_sync"])
+    db.commit()
+    log(f"{len(data['prs'])} PRs changed on {server} since {since or 'the beginning'}")
+
+
 def cmd_update(args: argparse.Namespace) -> None:
     lock = open(SYNC_LOCK_PATH, "w")  # released when the process ends
     try:
@@ -234,16 +263,19 @@ def cmd_update(args: argparse.Namespace) -> None:
         raise TriageError("another `triage update` is running; not starting a second one") from None
     db = open_db()
     cat = load_categorizer(db)
-    gh = GitHub(github_token(), delay=args.delay, reserve=args.reserve)
     started = time.monotonic()
-    if args.full and meta_get(db, "full_sync_run") is None:
-        meta_set(db, "full_sync_run", iso(utcnow()))
-        db.commit()
-    if meta_get(db, "full_sync_run") is not None or meta_get(db, "last_sync") is None:
-        sync_full(gh, db, cat, args.page_size)
-    sync_incremental(gh, db, cat, args.page_size)
+    server = "" if args.github else load_settings(db)["server"]
+    if server:
+        sync_from_server(db, cat, server)
+        requests = "1 request to the server"
+    else:
+        gh = GitHub(github_token(), delay=args.delay, reserve=args.reserve)
+        if args.full and meta_get(db, "full_sync_run") is None:
+            meta_set(db, "full_sync_run", iso(utcnow()))
+            db.commit()
+        if meta_get(db, "full_sync_run") is not None or meta_get(db, "last_sync") is None:
+            sync_full(gh, db, cat, args.page_size)
+        sync_incremental(gh, db, cat, args.page_size)
+        requests = f"{gh.requests} requests, {gh.points_used} points"
     open_count = db.execute("SELECT COUNT(*) FROM prs WHERE state = 'OPEN'").fetchone()[0]
-    log(
-        f"done in {time.monotonic() - started:.0f}s: {gh.requests} requests, {gh.points_used} points; "
-        f"{open_count} open PRs in {DB_PATH}"
-    )
+    log(f"done in {time.monotonic() - started:.0f}s: {requests}; {open_count} open PRs in {DB_PATH}")

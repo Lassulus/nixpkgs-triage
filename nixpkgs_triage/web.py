@@ -30,7 +30,7 @@ from .jobs import (
 from .listing import DEFAULT_FILTERS, FILTERS, Jobs, category_counts, load_open_rows, visible_rows
 from .query import ci_label, review_marker
 from .sync import SyncJob
-from .util import TriageError, age, log, parse_ts, pr_url, since
+from .util import TriageError, age, iso, log, parse_ts, pr_url, since, utcnow
 
 PAGE_SIZE = 100
 
@@ -301,6 +301,15 @@ class Snapshot:
         with self.lock:
             return self.db.execute("SELECT * FROM prs WHERE number = ?", (number,)).fetchone()
 
+    def changed_since(self, since: str) -> dict:
+        """PR rows synced at or after `since` (all when empty), for `triage update` on clients."""
+        with self.lock:
+            now = iso(utcnow())
+            rows = self.db.execute("SELECT * FROM prs WHERE synced_at >= ?", (since,)).fetchall()
+            last_sync = meta_get(self.db, "last_sync")
+        prs = [{k: r[k] for k in r.keys() if k != "seen_run"} for r in rows]
+        return {"now": now, "last_sync": last_sync, "prs": prs}
+
 
 class SyncLoop(threading.Thread):
     """`triage update` every `interval` seconds after the previous run ended."""
@@ -313,7 +322,7 @@ class SyncLoop(threading.Thread):
 
     def run(self) -> None:
         while True:
-            self.job = SyncJob(echo=True)
+            self.job = SyncJob("--github", echo=True)  # the server is where the data comes from
             self.job.thread.join()
             time.sleep(self.interval)
 
@@ -500,6 +509,8 @@ class Handler(BaseHTTPRequestHandler):
         parts = url.path.strip("/").split("/")
         if url.path == "/":
             self.send(200, self.server.page(state))
+        elif url.path == "/api/prs":
+            self.send(200, json.dumps(self.server.snapshot.changed_since(params.get("since", ""))), "application/json")
         elif url.path == "/rows":
             offset, generation = params.get("offset", ""), params.get("gen", "")
             rows = self.server.rows(
@@ -512,13 +523,13 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send(404, "not found")
 
-    def send(self, status: int, html: str) -> None:
-        body = html.encode()
+    def send(self, status: int, text: str, content_type: str = "text/html; charset=utf-8") -> None:
+        body = text.encode()
         gzipped = "gzip" in self.headers.get("Accept-Encoding", "")
         if gzipped:
             body = gzip.compress(body, 5)
         self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
         if gzipped:
             self.send_header("Content-Encoding", "gzip")

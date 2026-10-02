@@ -25,7 +25,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(prog="triage", description=nixpkgs_triage.__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("update", help="sync the local database with GitHub")
+    p = sub.add_parser("update", help="sync the local database from the sync server (setting `server`) or GitHub")
+    p.add_argument("--github", action="store_true", help="sync from GitHub even if a sync server is set")
     p.add_argument("--full", action="store_true", help="re-walk all open PRs (first run does this automatically)")
     p.add_argument("--page-size", type=int, default=50, help="PRs per request; shrinks automatically on timeouts")
     p.add_argument("--delay", type=float, default=1.0, help="seconds between requests (secondary rate limit)")
