@@ -307,8 +307,10 @@ class Snapshot:
             now = iso(utcnow())
             rows = self.db.execute("SELECT * FROM prs WHERE synced_at >= ?", (since,)).fetchall()
             last_sync = meta_get(self.db, "last_sync")
+            # After a finished full sync the server knows every open PR, so a full dump is authoritative.
+            complete = last_sync is not None and meta_get(self.db, "full_sync_run") is None
         prs = [{k: r[k] for k in r.keys() if k != "seen_run"} for r in rows]
-        return {"now": now, "last_sync": last_sync, "prs": prs}
+        return {"now": now, "last_sync": last_sync, "complete": complete, "prs": prs}
 
 
 class SyncLoop(threading.Thread):

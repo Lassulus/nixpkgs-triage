@@ -248,6 +248,12 @@ def sync_from_server(db: sqlite3.Connection, cat: Categorizer, server: str) -> N
     columns = {r["name"] for r in db.execute("PRAGMA table_info(prs)")} - {"seen_run", "category", "tags", "topics"}
     for row in data["prs"]:
         write_row(db, cat, {k: v for k, v in row.items() if k in columns})
+    if not since and data.get("complete"):
+        # PRs closed before the server's full sync never reached it; their local rows would stay open forever.
+        numbers = json.dumps([row["number"] for row in data["prs"]])
+        gone = db.execute("DELETE FROM prs WHERE number NOT IN (SELECT value FROM json_each(?))", (numbers,)).rowcount
+        if gone:
+            log(f"dropped {gone} local PRs the server doesn't know (closed before it started syncing)")
     # The server commits a sync page after stamping its rows, so re-read a little before its clock.
     meta_set(db, "server_since", iso(parse_ts(data["now"]) - SYNC_OVERLAP))
     meta_set(db, "last_sync", data["last_sync"])
