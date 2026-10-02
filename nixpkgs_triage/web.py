@@ -12,7 +12,7 @@ import threading
 import time
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from .categorize import load_categorizer
@@ -27,32 +27,94 @@ from .jobs import (
     output_lines,
     reap_jobs,
 )
-from .listing import DEFAULT_FILTERS, FILTERS, SORTS, Jobs, category_counts, load_open_rows, sorted_rows, visible_rows
+from .listing import DEFAULT_FILTERS, FILTERS, Jobs, category_counts, load_open_rows, visible_rows
 from .query import ci_label, review_marker
 from .sync import SyncJob
-from .util import TriageError, age, log, pr_url, since
+from .util import TriageError, age, log, parse_ts, pr_url, since
 
 PAGE_SIZE = 100
-DEFAULTS = {"category": "all", "sort": SORTS[0][0], **DEFAULT_FILTERS, "q": ""}
-OPTIONS = {"sort": [s[0] for s in SORTS], **{key: options for key, _, options in FILTERS}}
+
+
+class Column(NamedTuple):
+    name: str
+    width: str  # default grid track
+    cell: Callable[[dict, Jobs], tuple[str, object]]  # -> (css class, html)
+    key: Callable[[dict, Jobs], object]  # sort key
+    desc_first: bool  # the first click on the header sorts descending
+
+
+def filled_first(value: str) -> tuple[bool, str]:
+    return (value == "", value)
+
+
+def job_column(name: str, kind: str) -> Column:
+    def short(r: dict, jobs: Jobs) -> str:
+        return job_short(jobs.get((r["number"], kind)))
+
+    return Column(name, "4.5em", lambda r, j: (short(r, j), short(r, j)), lambda r, j: filled_first(short(r, j)), False)
+
+
+def names_column(name: str, field: str, css: str) -> Column:
+    def names(r: dict) -> list[str]:
+        return json.loads(r[field] or "[]")
+
+    return Column(name, "8.6em", lambda r, j: (css, escape(", ".join(names(r)))), lambda r, j: len(names(r)), True)
+
+
 COLUMNS = (
-    "",
-    "PR",
-    "age",
-    "+/-",
-    "CI",
-    "conflict",
-    "draft",
-    "mark",
-    "check",
-    "nixrev",
-    "likes",
-    "approved by",
-    "blocked by",
-    "author",
-    "category",
-    "title",
+    Column("PR", "5.6em", lambda r, j: ("", f"#{r['number']}"), lambda r, j: r["number"], True),
+    # Ages sort by time since: ascending is the newest first.
+    Column(
+        "age",
+        "4em",
+        lambda r, j: ("", age(r["created_at"])),
+        lambda r, j: -parse_ts(r["created_at"]).timestamp(),
+        True,
+    ),
+    Column(
+        "updated",
+        "5.6em",
+        lambda r, j: ("", since(r["updated_at"])),
+        lambda r, j: -parse_ts(r["updated_at"]).timestamp(),
+        False,
+    ),
+    Column(
+        "+/-",
+        "7.6em",
+        lambda r, j: ("", f'<span class="add">+{r["additions"]}</span>/<span class="del">-{r["deletions"]}</span>'),
+        lambda r, j: r["additions"] + r["deletions"],
+        True,
+    ),
+    Column(
+        "CI",
+        "5.1em",
+        lambda r, j: ("failing" if r["ci_state"] in ("FAILURE", "ERROR") else "", ci_label(r["ci_state"])),
+        lambda r, j: ci_label(r["ci_state"]),
+        False,
+    ),
+    Column("conflict", "5.1em", lambda r, j: ("", "yes" if r["conflict"] else ""), lambda r, j: r["conflict"], True),
+    Column("draft", "3.6em", lambda r, j: ("", "yes" if r["is_draft"] else ""), lambda r, j: r["is_draft"], True),
+    Column(
+        "mark", "4.1em", lambda r, j: ("", escape(review_marker(r))), lambda r, j: filled_first(review_marker(r)), False
+    ),
+    job_column("check", "check"),
+    job_column("nixrev", "review"),
+    Column("likes", "3.6em", lambda r, j: ("", r["likes"] or ""), lambda r, j: r["likes"], True),
+    names_column("approved by", "approvals", "pass"),
+    names_column("blocked by", "blocking", "failing"),
+    Column(
+        "author",
+        "8.6em",
+        lambda r, j: ("author", escape(r["author"] or "")),
+        lambda r, j: (r["author"] or "").lower(),
+        False,
+    ),
+    Column("category", "11em", lambda r, j: ("dim", escape(r["category"])), lambda r, j: r["category"], False),
+    Column("title", "minmax(12em, 1fr)", lambda r, j: ("", escape(r["title"])), lambda r, j: r["title"].lower(), False),
 )
+COLUMN = {c.name: c for c in COLUMNS}
+DEFAULTS = {"category": "all", "sort": "-age", **DEFAULT_FILTERS, "q": ""}
+OPTIONS = {"sort": [p + c.name for c in COLUMNS for p in ("", "-")], **{key: options for key, _, options in FILTERS}}
 # GitHub reaction names
 EMOJI = {
     "THUMBS_UP": "👍",
@@ -78,17 +140,19 @@ main { margin-left: 15em; padding: 0 1em; }
 form { display: flex; flex-wrap: wrap; gap: 1em; padding: .5em 0; }
 input[type=search] { width: 20em; }
 summary, .head { display: grid; padding: .15em 0; white-space: nowrap;
-  grid-template-columns: 1.6em 5.6em 3.1em 7.6em 5.1em 5.1em 3.6em 4.1em 4.1em 4.8em 3.6em 8.6em 8.6em 8.6em 11em 1fr;
   border-bottom: 1px solid color-mix(in srgb, GrayText 30%, transparent); }
 summary { list-style: none; }
 summary:hover { background: color-mix(in srgb, GrayText 12%, Canvas); }
 summary > a { color: inherit; text-decoration: none; overflow: hidden; text-overflow: ellipsis; padding-right: .6em; }
 summary > a.author:hover { text-decoration: underline; }
-.head > span { overflow: hidden; text-overflow: ellipsis; padding-right: .6em; }
+.head { position: sticky; top: 2.6em; z-index: 1; background: Canvas; font-weight: bold; }
+.head > a { position: relative; color: inherit; text-decoration: none; overflow: hidden; text-overflow: ellipsis;
+  padding-right: .6em; }
+.grip { position: absolute; top: 0; right: 0; width: 5px; height: 100%; cursor: col-resize; }
+.grip:hover { background: GrayText; }
 .fold { cursor: pointer; text-align: center; color: GrayText; }
 .fold::before { content: "▸"; }
 details[open] .fold::before { content: "▾"; }
-.head { font-weight: bold; }
 .draft, .dim { color: GrayText; }
 .add, .pass { color: var(--add); }
 .del, .FAIL, .issues, .failing { color: var(--del); }
@@ -98,6 +162,27 @@ details[open] .fold::before { content: "▾"; }
 pre { max-height: 32em; overflow: auto; padding: .5em; border: 1px solid GrayText; white-space: pre-wrap; }
 pre.log { white-space: pre; }
 """
+
+# Column order and widths live in localStorage; applied in <head>, before the rows render.
+LAYOUT_JS = (
+    f"const COLS = {json.dumps([[c.name, c.width] for c in COLUMNS])}, NAMES = COLS.map((c) => c[0]);"
+    + """
+const layout = () => {
+  const saved = JSON.parse(localStorage.getItem("cols") || "{}");
+  const order = (saved.order || []).filter((n) => NAMES.includes(n));
+  NAMES.forEach((n, i) => order.includes(n) || order.splice(i, 0, n));
+  return { order, widths: saved.widths || {} };
+};
+const applyLayout = ({ order, widths }) => {
+  const width = (n) => widths[n] || COLS[NAMES.indexOf(n)][1];
+  document.getElementById("cols").textContent =
+    `summary, .head { grid-template-columns: 1.6em ${order.map(width).join(" ")}; }` +
+    order.map((n, i) => `.c${NAMES.indexOf(n)} { order: ${i + 1}; }`).join("");
+};
+const saveLayout = (l) => (localStorage.setItem("cols", JSON.stringify(l)), applyLayout(l));
+applyLayout(layout());
+"""
+)
 
 # Infinite scroll: a.more links fetch the next rows; opening a PR fetches its detail; detail links reload the pane.
 JS = """
@@ -137,6 +222,46 @@ search.addEventListener("input", () => {
     const next = document.querySelector("a.more");
     if (next) more.observe(next);
   }, 150);
+});
+// Header: drag a column onto another to reorder, drag its right edge to resize; the order and widths are saved.
+const head = document.querySelector(".head");
+let dragged = null;
+head.addEventListener("dragstart", (e) => {
+  if (e.target.closest(".grip")) return e.preventDefault();
+  dragged = e.target.closest("[data-col]").dataset.col;
+  e.dataTransfer.effectAllowed = "move";
+  e.dataTransfer.setData("text/plain", dragged);
+});
+document.addEventListener("dragover", (e) => dragged && e.preventDefault());
+document.addEventListener("drop", (e) => {
+  if (!dragged) return;
+  e.preventDefault();
+  const target = e.target.closest(".head [data-col]");
+  if (!target || target.dataset.col === dragged) return;
+  const l = layout(), box = target.getBoundingClientRect();
+  l.order.splice(l.order.indexOf(dragged), 1);
+  l.order.splice(l.order.indexOf(target.dataset.col) + (e.clientX > box.left + box.width / 2), 0, dragged);
+  saveLayout(l);
+});
+document.addEventListener("dragend", () => (dragged = null));
+head.addEventListener("pointerdown", (e) => {
+  const grip = e.target.closest(".grip");
+  if (!grip) return;
+  e.preventDefault();
+  grip.setPointerCapture(e.pointerId);
+  const l = layout(), name = grip.parentNode.dataset.col, x = e.clientX;
+  const width = grip.parentNode.getBoundingClientRect().width;
+  grip.onpointermove = (m) => ((l.widths[name] = Math.max(24, width + m.clientX - x) + "px"), applyLayout(l));
+  grip.onpointerup = () => ((grip.onpointermove = grip.onpointerup = null), saveLayout(l));
+});
+head.addEventListener("click", (e) => e.target.closest(".grip") && e.preventDefault());
+head.addEventListener("dblclick", (e) => {
+  const grip = e.target.closest(".grip");
+  if (grip) {
+    const l = layout();
+    delete l.widths[grip.parentNode.dataset.col];
+    saveLayout(l);
+  }
 });
 """
 
@@ -220,37 +345,17 @@ def fuzzy(q: str):
 
 
 def row_html(r: dict, jobs: Jobs) -> str:
-    n = r["number"]
-    check, review = job_short(jobs.get((n, "check"))), job_short(jobs.get((n, "review")))
-    approvers, blockers = (escape(", ".join(json.loads(r[column] or "[]"))) for column in ("approvals", "blocking"))
-    author = escape(r["author"] or "")
-    cells = [
-        ("", f"#{n}"),
-        ("", age(r["created_at"])),
-        ("", f'<span class="add">+{r["additions"]}</span>/<span class="del">-{r["deletions"]}</span>'),
-        ("failing" if r["ci_state"] in ("FAILURE", "ERROR") else "", ci_label(r["ci_state"])),
-        ("", "yes" if r["conflict"] else ""),
-        ("", "yes" if r["is_draft"] else ""),
-        ("", escape(review_marker(r))),
-        (check, check),
-        (review, review),
-        ("", r["likes"] or ""),
-        ("pass", approvers),
-        ("failing", blockers),
-        ("author", author),
-        ("dim", escape(r["category"])),
-        ("", escape(r["title"])),
-    ]
+    n, author = r["number"], r["author"] or ""
     # Every cell links to the PR, except the author's, which links to their profile.
     profile = f"https://github.com/apps/{author[:-5]}" if author.endswith("[bot]") else f"https://github.com/{author}"
-    pr, profile = pr_url(n), profile if author else pr_url(n)
-    links = "".join(
-        f'<a class="{cls}" href="{profile if cls == "author" else pr}" target="_blank">{text}</a>'
-        for cls, text in cells
+    cells = "".join(
+        f'<a class="c{i} {css}" href="{escape(profile) if css == "author" and author else pr_url(n)}" '
+        f'target="_blank">{html}</a>'
+        for i, (css, html) in enumerate(column.cell(r, jobs) for column in COLUMNS)
     )
     return (
         f'<details data-n="{n}"><summary class="{"draft" if r["is_draft"] else ""}">'
-        f'<span class="fold" title="details"></span>{links}</summary><div class="pane">loading…</div></details>'
+        f'<span class="fold" title="details"></span>{cells}</summary><div class="pane">loading…</div></details>'
     )
 
 
@@ -265,48 +370,40 @@ class Dashboard(ThreadingHTTPServer):
         self.sync = sync
         self.lists: dict = {}  # (generation, filters, sort) -> (visible, sorted, category counts)
 
-    def listing(self, state: dict) -> tuple[Data, list, list, list]:
+    def listing(self, state: dict, generation: int | None = None) -> tuple[Data, int, list, list, list]:
+        """Filtered and sorted open PRs of `generation` while it is cached (so paging stays consistent), else current."""
         data = self.snapshot.current()
-        filters = {k: state[k] for k in DEFAULT_FILTERS}
-        key = (data.generation, tuple(filters.items()), state["sort"])
+        filters = tuple((k, state[k]) for k in DEFAULT_FILTERS)
+        key = (generation, filters, state["sort"])
+        if key not in self.lists:
+            key = (data.generation, filters, state["sort"])
         if key not in self.lists:
             if len(self.lists) > 32:
                 self.lists.clear()
-            visible = visible_rows(data.rows, data.jobs, filters)
-            counts = category_counts(self.snapshot.category_names, visible)
-            self.lists[key] = (visible, sorted_rows(visible, state["sort"]), counts)
-        return data, *self.lists[key]
+            visible = visible_rows(data.rows, data.jobs, dict(filters))
+            column = COLUMN[state["sort"].lstrip("-")]
+            ordered = sorted(
+                visible, key=lambda r: (column.key(r, data.jobs), r["number"]), reverse=state["sort"].startswith("-")
+            )
+            self.lists[key] = (visible, ordered, category_counts(self.snapshot.category_names, visible))
+        return data, key[0], *self.lists[key]
 
-    def rows(self, state: dict, after: str = "") -> str:
-        """The next PAGE_SIZE rows after the cursor (sort value|number), plus the link to the following page."""
-        data, _, prs, _ = self.listing(state)
+    def rows(self, state: dict, offset: int = 0, generation: int | None = None) -> str:
+        """PAGE_SIZE rows from offset, plus the link to the next page (of the same data generation)."""
+        data, generation, _, prs, _ = self.listing(state, generation)
         if state["category"] != "all":
             prs = [r for r in prs if r["category"] == state["category"]]
         if state["q"].strip():
             prs = list(filter(fuzzy(state["q"]), prs))
-        _, column, descending = next(s for s in SORTS if s[0] == state["sort"])
-        start = 0
-        if after:
-            value, _, number = after.rpartition("|")
-            # Same type as the sort column (likes are numbers), so it compares with the rows' keys.
-            cursor = (type(prs[0][column])(value) if prs else value, int(number or 0))
-
-            def past(r: dict) -> bool:
-                key = (r[column], r["number"])
-                return key < cursor if descending else key > cursor
-
-            start = next((i for i, r in enumerate(prs) if past(r)), len(prs))
-        page = prs[start : start + PAGE_SIZE]
-        html = "".join(row_html(r, data.jobs) for r in page)
-        if state["q"].strip() and not after:
+        html = "".join(row_html(r, data.jobs) for r in prs[offset : offset + PAGE_SIZE])
+        if state["q"].strip() and not offset:
             html = f'<p class="dim">{len(prs)} matching “{escape(state["q"])}”</p>' + html
-        if start + PAGE_SIZE < len(prs):
-            last = page[-1]
-            html += f'<a class="more" href="/rows?{query(state, after=f"{last[column]}|{last["number"]}")}">more</a>'
+        if offset + PAGE_SIZE < len(prs):
+            html += f'<a class="more" href="/rows?{query(state, offset=offset + PAGE_SIZE, gen=generation)}">more</a>'
         return html
 
     def page(self, state: dict) -> str:
-        data, visible, _, counts = self.listing(state)
+        data, _, visible, _, counts = self.listing(state)
         cats = "".join(
             f'<a class="{"sel" if name == state["category"] else ""}" href="/?{query(state, category=name)}">'
             f"{escape(name)}<span>{n}</span></a>"
@@ -316,8 +413,21 @@ class Dashboard(ThreadingHTTPServer):
             f'<label>{label} <select name="{key}" onchange="this.form.submit()">'
             + "".join(f"<option{' selected' if o == state[key] else ''}>{o}</option>" for o in options)
             + "</select></label>"
-            for key, label, options in (("sort", "sort", OPTIONS["sort"]), *FILTERS)
+            for key, label, options in FILTERS
         )
+        sort, desc = state["sort"].lstrip("-"), state["sort"].startswith("-")
+
+        def header(i: int, c: Column) -> str:
+            # A click sorts by the column, a second click reverses.
+            if c.name == sort:
+                new, arrow = ("" if desc else "-") + c.name, " ▼" if desc else " ▲"
+            else:
+                new, arrow = ("-" if c.desc_first else "") + c.name, ""
+            return (
+                f'<a class="c{i}" data-col="{escape(c.name)}" draggable="true" href="/?{query(state, sort=new)}">'
+                f'{escape(c.name)}{arrow}<i class="grip" title="drag to resize, double-click to reset"></i></a>'
+            )
+
         status = [f"{len(visible)} of {len(data.rows)} open PRs match"]
         status.append(f"last sync {since(data.last_sync)} ago" if data.last_sync else "never synced")
         if self.sync and self.sync.status():
@@ -325,12 +435,15 @@ class Dashboard(ThreadingHTTPServer):
         return (
             f'<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
             f'<title>nixpkgs-triage</title><link rel="icon" href="data:,"><style>{CSS}</style>'
+            f'<style id="cols"></style><script>{LAYOUT_JS}</script>'
             f"<header><b>nixpkgs-triage</b>{''.join(f'<span>{s}</span>' for s in status)}</header>"
             f"<nav>{cats}</nav><main>"
             f'<form><input type="hidden" name="category" value="{escape(state["category"])}">'
+            f'<input type="hidden" name="sort" value="{escape(state["sort"])}">'
             f'<input type="search" name="q" value="{escape(state["q"])}" placeholder="fuzzy search" autofocus>'
-            f"{selects}</form>"
-            f'<div class="head">{"".join(f"<span>{c}</span>" for c in COLUMNS)}</div>'
+            f'{selects}<button type="button" onclick="localStorage.removeItem(\'cols\'), applyLayout(layout())">'
+            f"reset columns</button></form>"
+            f'<div class="head"><span></span>{"".join(header(i, c) for i, c in enumerate(COLUMNS))}</div>'
             f'<div id="rows">{self.rows(state) or "<p class=dim>no PRs match</p>"}</div></main><script>{JS}</script>'
         )
 
@@ -388,7 +501,11 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/":
             self.send(200, self.server.page(state))
         elif url.path == "/rows":
-            self.send(200, self.server.rows(state, params.get("after", "")))
+            offset, generation = params.get("offset", ""), params.get("gen", "")
+            rows = self.server.rows(
+                state, int(offset) if offset.isdigit() else 0, int(generation) if generation.isdigit() else None
+            )
+            self.send(200, rows)
         elif len(parts) == 2 and parts[0] == "pr" and parts[1].isdigit():
             tab = params.get("tab") if params.get("tab") in JOB_TITLES else "check"
             self.send(200, self.server.detail(int(parts[1]), tab, params.get("log") == "1"))

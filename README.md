@@ -61,11 +61,13 @@ PR comment.
 ./triage serve --listen '[::]:8080' --sync-every 0
 ```
 
-The curses list as one endlessly scrolling, server-rendered page, plus `likes` (👍 ❤️ 🎉 🚀
-reactions on the PR; sort by `most liked` to see which new packages people want), `approved by`
-and `blocked by` (reviewers whose latest review approves / requests changes) and `author` columns.
-Clicking a row opens the PR on GitHub, clicking
-the author their profile; `▸` folds out the details and reports. The
+The curses list as one endlessly scrolling, server-rendered page, plus `updated`, `likes` (👍 ❤️ 🎉
+🚀 reactions; sort by them to see which new packages people want), `approved by` and `blocked by`
+(reviewers whose latest review approves / requests changes) and `author` columns. Click a header
+to sort by it (again to reverse), drag a header onto another to move the column, drag its right
+edge to resize (double-click resets); the layout is kept in the browser, "reset columns" restores
+it. Clicking a row opens the PR on GitHub, clicking the author their profile; `▸` folds out the
+details and reports. The
 search box filters live with fuzzy matching on number, title and author (`pyth req` finds
 `python3Packages.requests`). Filters and search live in the URL. It only reads the database (the
 sync loop is the only thing talking to GitHub), is read-only and has no authentication: put it
